@@ -1,0 +1,8 @@
+# Build output
+dist/
+*.zip
+*.tar.gz
+
+# Editors / OS
+.DS_Store
+*.swp

@@ -1,0 +1,1683 @@
+#!/usr/bin/env bash
+# zen-gh - discover, track, install and update GitHub projects for the
+# "Zen GitHub Update" Omarchy bar widget.
+#
+# It manages two kinds of thing:
+#   app     a top-level git checkout under $HOME with a github.com origin
+#   plugin  a checkout under ~/.config/omarchy/plugins (an Omarchy shell plugin)
+#
+#   zen-gh list-json [--fetch] [--sync-menu]  one JSON array of tracked apps
+#   zen-gh add <url|owner/repo>               clone/install a new GitHub project
+#   zen-gh update <name|id>                   pull (+build/rescan) one project
+#   zen-gh update-all                         update every project that is behind
+#   zen-gh install <name|id>                  (re)run a checkout's install steps
+#   zen-gh defaults <name|id>                 show Omarchy defaults an app holds
+#   zen-gh remove <name|id>                   deactivate its Omarchy defaults
+#   zen-gh uninstall <name|id> [--yes]        undo the install: revert the config
+#                                             it changed, then drop its defaults,
+#                                             .desktop, checkout and menu row
+#   zen-gh ignore <name>                      forget (hide) an app; files kept
+#                                             (its menu row is dropped)
+#   zen-gh unignore <name>                    stop hiding an app
+#   zen-gh link <name> <folder>               point a tracked name at the folder
+#                                             that holds its source (used by
+#                                             update/install, shown as its path)
+#   zen-gh unlink <name>                      drop that link
+#   zen-gh links                              list linked folders
+#   zen-gh launcher <name|id>                 (re)register an app's built binary
+#                                             as a launcher entry
+#   zen-gh sync-menu                          add a menu row for anything missing
+#                                             and prune rows for things removed
+#                                             by other tools
+#
+# Install: `add` clones the repo. If it is an Omarchy shell plugin (manifest
+# with schemaVersion/id/entryPoints) it is installed into the plugins dir and
+# enabled. Otherwise it is treated as an app: the repo's own install steps are
+# followed (install.sh/setup.sh/scripts/install.sh, then a Makefile/justfile
+# `install` target), falling back to its detected build system. Either way the
+# checkout gets a menu row and, once there is a binary, a launcher entry in
+# ~/.local/share/applications so it shows up in the Omarchy menu's app list.
+set -uo pipefail
+
+HOME_DIR="${HOME:?HOME is not set}"
+STATE_DIR="$HOME_DIR/.config/omarchy/zengithubupdate"
+IGNORE_FILE="$STATE_DIR/ignored"
+LINKS_FILE="$STATE_DIR/links"
+PLUGINS_DIR="$HOME_DIR/.config/omarchy/plugins"
+MENU_FILE="$HOME_DIR/.config/omarchy/extensions/omarchy-menu.jsonc"
+SELF_ID="github-update"
+
+APP_ICON=$'\U000f01da'
+PLUGIN_ICON=$'\U000f0431'
+
+PLUGIN_STATE=""
+
+mkdir -p "$STATE_DIR"
+[ -f "$IGNORE_FILE" ] || : >"$IGNORE_FILE"
+
+say() { printf '%s\n' "$*" >&2; }
+die() { say "zen-gh: $*"; exit 1; }
+
+# git@github.com:owner/repo.git -> owner/repo  (also https/ssh forms; a plain
+# "owner/repo" or "owner/repo.git" is accepted as-is with the suffix dropped)
+github_slug() {
+  local u="${1%.git}"
+  case "$u" in
+    git@github.com:*)         printf '%s' "${u#git@github.com:}" ;;
+    ssh://git@github.com/*)   printf '%s' "${u#ssh://git@github.com/}" ;;
+    https://github.com/*)     printf '%s' "${u#https://github.com/}" ;;
+    http://github.com/*)      printf '%s' "${u#http://github.com/}" ;;
+    https://www.github.com/*) printf '%s' "${u#https://www.github.com/}" ;;
+    */*/*)                    printf '' ;;
+    */*)                      printf '%s' "$u" ;;
+    *)                        printf '' ;;
+  esac
+}
+
+ignored() { grep -Fxq "$1" "$IGNORE_FILE" 2>/dev/null; }
+
+# A link maps a tracked name (an app folder or a plugin id) to the folder that
+# actually holds its source, for projects kept outside $HOME or installed from
+# a zip instead of a git clone. One `name<TAB>path` line per link.
+link_for() {
+  [ -f "$LINKS_FILE" ] || return 0
+  awk -F'\t' -v k="$1" '$1 == k && $2 != "" { print $2; exit }' "$LINKS_FILE" 2>/dev/null
+}
+
+# True when <path> is the source folder of a link. Those folders are skipped by
+# discovery so a linked project shows up once, under its tracked name.
+is_link_target() {
+  [ -s "$LINKS_FILE" ] || return 1
+  awk -F'\t' -v p="${1%/}" '$2 == p { found = 1 } END { exit !found }' "$LINKS_FILE"
+}
+
+# Resolve a human name to the key used in the links file, so "Pen Setup",
+# "pensetup" and "pen-setup" all land on the installed plugin's id.
+canonical_name() {
+  local q="$1" lq dir id nm label cand
+  lq="$(printf '%s' "$q" | tr '[:upper:]' '[:lower:]')"
+  for dir in "$PLUGINS_DIR"/*/; do
+    [ -f "${dir%/}/manifest.json" ] || continue
+    id="$(plugin_field "${dir%/}" id)"
+    nm="$(basename "${dir%/}")"
+    label="$(plugin_field "${dir%/}" name)"
+    for cand in "$id" "$nm" "$label"; do
+      [ -n "$cand" ] || continue
+      [ "$(printf '%s' "$cand" | tr '[:upper:]' '[:lower:]')" = "$lq" ] && {
+        printf '%s' "$id"
+        return 0
+      }
+    done
+  done
+  for dir in "$HOME_DIR"/*/; do
+    [ -d "${dir%/}/.git" ] || continue
+    nm="$(basename "${dir%/}")"
+    [ "$(printf '%s' "$nm" | tr '[:upper:]' '[:lower:]')" = "$lq" ] && {
+      printf '%s' "$nm"
+      return 0
+    }
+  done
+  printf '%s' "$q"
+}
+
+# The configured origin URL, before any url.*.insteadOf rewrite is applied.
+# `git remote get-url` rewrites (e.g. an ssh/mirror insteadOf) and can hide a
+# github.com origin, so read the raw config value instead.
+origin_url() {
+  local dir="$1" url
+  url="$(git -C "$dir" config --get remote.origin.url 2>/dev/null)"
+  [ -n "$url" ] || url="$(git -C "$dir" remote get-url origin 2>/dev/null)"
+  printf '%s' "$url"
+}
+
+sanitize_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '-'; }
+prettify() {
+  printf '%s' "$1" | sed -E 's/[-_]+/ /g' |
+    awk '{for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2)} 1'
+}
+
+# Fetch a checkout, repairing a broken object store when needed. A normal fetch
+# can fail with "pack has 92 unresolved deltas" after an interrupted download
+# (which also leaves stray tmp_pack_* files); `--refetch` re-downloads the
+# objects those remote-tracking refs need.
+fetch_origin() {
+  local dir="$1"
+  find "$dir/.git/objects/pack" -maxdepth 1 -name 'tmp_pack_*' -mmin +60 -delete 2>/dev/null
+  git -C "$dir" fetch --quiet --prune origin 2>/dev/null && return 0
+  say "  fetch failed; retrying with --refetch to repair"
+  git -C "$dir" fetch --quiet --refetch --prune origin 2>/dev/null
+}
+
+behind_count() {
+  local dir="$1" branch="$2" b
+  b="$(git -C "$dir" rev-list --count HEAD..@{upstream} 2>/dev/null)"
+  [ -n "$b" ] || b="$(git -C "$dir" rev-list --count "HEAD..origin/${branch:-HEAD}" 2>/dev/null)"
+  if [ -z "$b" ]; then
+    # Broken or missing remote refs (e.g. origin/main pointing at a pruned
+    # object): fetch to repair them, then retry once.
+    fetch_origin "$dir"
+    b="$(git -C "$dir" rev-list --count HEAD..@{upstream} 2>/dev/null)"
+    [ -n "$b" ] || b="$(git -C "$dir" rev-list --count "HEAD..origin/${branch:-HEAD}" 2>/dev/null)"
+  fi
+  [ -n "$b" ] || b=0
+  printf '%s' "$b"
+}
+
+build_tool() {
+  local dir="$1"
+  [ -f "$dir/Cargo.toml" ]     && { printf 'cargo'; return; }
+  [ -f "$dir/package.json" ]   && { printf 'npm';   return; }
+  [ -f "$dir/pyproject.toml" ] && { printf 'pip';   return; }
+  [ -f "$dir/go.mod" ]         && { printf 'go';    return; }
+  printf ''
+}
+
+# Build a checkout with its detected build system.
+build_app() {
+  local dir="$1" tool name
+  tool="$(build_tool "$dir")"
+  case "$tool" in
+    cargo)
+      name="$(basename "$dir")"
+      # Workspace apps ship a package named after the repo; build just that.
+      if grep -qE '^\[workspace\]' "$dir/Cargo.toml" 2>/dev/null &&
+        [ -d "$dir/apps/$name" ]; then
+        ( cd "$dir" && cargo build --release -p "$name" )
+      else
+        ( cd "$dir" && cargo build --release )
+      fi
+      ;;
+    npm)   ( cd "$dir" && npm install && npm run build --if-present ) ;;
+    pip)   ( cd "$dir" && python3 -m pip install -e . ) ;;
+    go)    ( cd "$dir" && go build ./... ) ;;
+    *)     say "-- no known build system; nothing to build" ;;
+  esac
+}
+
+# Follow the repo's own install instructions, then fall back to a build.
+install_app() {
+  local dir="$1" name
+  name="$(basename "$dir")"
+  say "==> Install instructions for $name"
+  if [ -f "$dir/install.sh" ]; then
+    ( cd "$dir" && bash ./install.sh )
+  elif [ -f "$dir/setup.sh" ]; then
+    ( cd "$dir" && bash ./setup.sh )
+  elif [ -f "$dir/scripts/install.sh" ]; then
+    ( cd "$dir" && bash ./scripts/install.sh )
+  elif [ -f "$dir/Makefile" ] && grep -qE '^install[[:space:]]*:' "$dir/Makefile"; then
+    ( cd "$dir" && make install )
+  elif [ -f "$dir/justfile" ] && grep -qE '^install([[:space:]]|:)' "$dir/justfile"; then
+    ( cd "$dir" && just install )
+  else
+    say "-- no install script; building instead"
+    build_app "$dir"
+  fi
+  # A build leaves the binary in target/release but registers nothing, so the
+  # app never appears in the launcher. Install the entry the repo ships (or a
+  # minimal one) pointing at what was just built.
+  install_launcher_entry "$dir"
+}
+
+# ------------------------------------------------------------ launcher entries
+# The Omarchy menu's app list comes from ~/.local/share/applications, so a
+# checkout whose binary was merely built has no button there. These helpers
+# register the built binary and take the entry away again on uninstall.
+
+# The .desktop file the repo ships for Linux packaging, if any.
+desktop_template_for() {
+  local dir="$1" f
+  for f in "$dir"/packaging/linux/*.desktop "$dir"/packaging/*.desktop "$dir"/*.desktop; do
+    [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  f="$(find "$dir" -maxdepth 3 \
+    \( -name target -o -name node_modules -o -name .git -o -name dist -o -name build \) -prune \
+    -o -name '*.desktop' -print -quit 2>/dev/null)"
+  [ -n "$f" ] && printf '%s' "$f"
+  return 0
+}
+
+# Is <f> a user desktop entry that launches something from <dir>?
+desktop_entry_points_into() {
+  awk -v d="$2" '/^(Exec|TryExec)=/ && index($0, d) { found = 1 } END { exit !found }' "$1" 2>/dev/null
+}
+
+# Basenames of the user desktop entries that launch something from <dir>.
+desktop_ids_in_dir() {
+  local dir="$1" f
+  for f in "$HOME_DIR"/.local/share/applications/*.desktop; do
+    [ -f "$f" ] || continue
+    desktop_entry_points_into "$f" "$dir" && basename "$f"
+  done
+}
+
+installed_icon_path() {
+  local n="$1" p f
+  [ -n "$n" ] || return 1
+  for p in "$HOME_DIR/.local/share/icons" "$HOME_DIR/.icons" \
+           /usr/local/share/icons /usr/share/icons /usr/share/pixmaps; do
+    [ -d "$p" ] || continue
+    f="$(find "$p" -maxdepth 4 \( -name "$n.svg" -o -name "$n.png" -o -name "$n.xpm" \) -print -quit 2>/dev/null)"
+    [ -n "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+repo_icon() {
+  local dir="$1" f
+  for f in "$dir"/assets/app-icon/*-1024.png "$dir"/assets/app-icon/*.png "$dir"/assets/app-icon/*.svg \
+           "$dir"/assets/*.png "$dir"/assets/*.svg; do
+    [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+# A built executable for the checkout: the template's own command name first,
+# then the repo name, then the only executable in target/release (a workspace
+# with several binaries is ambiguous and gets no entry).
+app_binary() {
+  local dir="$1" name="$2" cmd="${3:-}" cand found="" n=0
+  for cand in "$cmd" "$name" "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"; do
+    [ -n "$cand" ] || continue
+    [ -x "$dir/target/release/$cand" ] && { printf '%s' "$dir/target/release/$cand"; return 0; }
+    [ -x "$dir/$cand" ] && { printf '%s' "$dir/$cand"; return 0; }
+  done
+  for cand in "$dir"/target/release/*; do
+    [ -f "$cand" ] && [ -x "$cand" ] || continue
+    case "$cand" in *.so|*.so.*|*.d|*.rlib|*.a|*.dylib) continue ;; esac
+    n=$((n + 1))
+    found="$cand"
+  done
+  [ "$n" = "1" ] && { printf '%s' "$found"; return 0; }
+  return 1
+}
+
+# A checkout with no packaged entry only gets one when it looks like a GUI app,
+# so command-line tools do not clutter the launcher.
+looks_graphical() {
+  local dir="$1"
+  grep -qsE '(egui|eframe|iced|tauri|slint|gtk|relm4|winit|qml|qt)' "$dir/Cargo.toml" 2>/dev/null && return 0
+  grep -qsE '"(tauri|electron|electron-builder|neutralino)"' "$dir/package.json" 2>/dev/null && return 0
+  return 1
+}
+
+install_launcher_entry() {
+  local dir="$1" name tpl cmd bin id icon out
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  name="$(basename "$dir")"
+  # Never override an entry a person (or the app's own installer) already made.
+  [ -n "$(desktop_ids_in_dir "$dir")" ] && return 0
+  tpl="$(desktop_template_for "$dir")"
+  if [ -z "$tpl" ] && ! looks_graphical "$dir"; then
+    return 0
+  fi
+  cmd=""
+  [ -n "$tpl" ] && cmd="$(sed -n 's/^Exec=//p' "$tpl" | head -n1 | awk '{print $1}' | tr -d '"')"
+  bin="$(app_binary "$dir" "$name" "$cmd")" || {
+    say "-- nothing built to launch yet; no launcher entry made"
+    return 0
+  }
+  # The repos ship their hicolor icon tree; copy it so the entry's themed Icon=
+  # resolves for the launcher's icon lookup.
+  [ -d "$dir/assets/app-icon/hicolor" ] &&
+    cp -r "$dir/assets/app-icon/hicolor/." "$HOME_DIR/.local/share/icons/" 2>/dev/null
+
+  icon=""
+  [ -n "$tpl" ] && icon="$(sed -n 's/^Icon=//p' "$tpl" | head -n1)"
+  if [ -n "$icon" ] && ! installed_icon_path "$icon" >/dev/null; then
+    icon="$(repo_icon "$dir")" || icon=""
+  fi
+  [ -n "$icon" ] || icon="$(repo_icon "$dir")" || icon=""
+
+  id="$name.desktop"
+  [ -n "$tpl" ] && id="$(basename "$tpl")"
+  out="$HOME_DIR/.local/share/applications/$id"
+  # If the packaged id is taken by an unrelated entry (an AppImage install that
+  # happens to share the id), fall back to a name-based id rather than clobber.
+  if [ -e "$out" ] && ! desktop_entry_points_into "$out" "$dir"; then
+    id="$name.desktop"
+    out="$HOME_DIR/.local/share/applications/$id"
+  fi
+  if [ -e "$out" ] && ! desktop_entry_points_into "$out" "$dir"; then
+    say "  $out already exists (not made by this checkout); leaving it"
+    return 0
+  fi
+  mkdir -p "$(dirname "$out")"
+  python3 - "$tpl" "$out" "$bin" "$icon" "$(prettify "$name")" <<'PY'
+import shlex, sys
+tpl, out, binp, icon, label = sys.argv[1:6]
+lines = []
+if tpl:
+    try:
+        lines = open(tpl).read().splitlines()
+    except OSError:
+        lines = []
+if not lines:
+    lines = ["[Desktop Entry]", "Type=Application", "Name=" + label,
+             "Terminal=false", "Categories=Utility;"]
+res, seen_exec, seen_try = [], False, False
+for ln in lines:
+    s = ln.strip()
+    if s.startswith("Exec="):
+        try:
+            parts = shlex.split(s[5:].strip())
+        except ValueError:
+            parts = [s[5:].strip()]
+        rest = parts[1:]
+        res.append("Exec=" + '"' + binp + '"' + ((" " + " ".join(rest)) if rest else ""))
+        seen_exec = True
+    elif s.startswith("TryExec="):
+        res.append("TryExec=" + binp)
+        seen_try = True
+    elif s.startswith("Icon="):
+        res.append("Icon=" + (icon or s[5:].strip()))
+    elif s.startswith("X-ZenGithubUpdate="):
+        continue
+    else:
+        res.append(ln)
+if not seen_exec:
+    res.append("Exec=" + '"' + binp + '"')
+if not seen_try:
+    res.append("TryExec=" + binp)
+if icon and not any(r.startswith("Icon=") for r in res):
+    res.append("Icon=" + icon)
+res.append("X-ZenGithubUpdate=true")
+open(out, "w").write("\n".join(res).rstrip("\n") + "\n")
+PY
+  command -v update-desktop-database >/dev/null 2>&1 &&
+    update-desktop-database "$HOME_DIR/.local/share/applications" >/dev/null 2>&1
+  say "  launcher entry: $id"
+}
+
+remove_launcher_entry() {
+  local dir="$1" f removed=0
+  [ -n "$dir" ] || return 0
+  for f in "$HOME_DIR"/.local/share/applications/*.desktop; do
+    [ -f "$f" ] || continue
+    desktop_entry_points_into "$f" "$dir" || continue
+    rm -f "$f"
+    removed=$((removed + 1))
+    say "  removed $(basename "$f")"
+  done
+  [ "$removed" = 0 ] && say "  no launcher entry to remove"
+  command -v update-desktop-database >/dev/null 2>&1 &&
+    update-desktop-database "$HOME_DIR/.local/share/applications" >/dev/null 2>&1
+  return 0
+}
+
+# ------------------------------------------------------------- omarchy plugin
+rescan_plugins() {
+  command -v omarchy-shell >/dev/null 2>&1 && omarchy-shell shell rescanPlugins >/dev/null 2>&1
+  return 0
+}
+
+plugin_field() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+path, key = sys.argv[1], sys.argv[2]
+try:
+    m = json.load(open(path + "/manifest.json"))
+except Exception:
+    sys.exit(0)
+val = m
+for part in key.split("."):
+    if isinstance(val, dict):
+        val = val.get(part, "")
+    else:
+        val = ""
+        break
+if isinstance(val, (dict, list)):
+    print("")
+else:
+    print(val if val is not None else "")
+PY
+}
+
+# A repo is an Omarchy shell plugin when its manifest carries the plugin shape.
+is_plugin_dir() {
+  [ -f "$1/manifest.json" ] || return 1
+  python3 - "$1/manifest.json" <<'PY'
+import json, sys
+try:
+    m = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if (m.get("schemaVersion") and m.get("id") and m.get("entryPoints")) else 1)
+PY
+}
+
+load_plugin_state() {
+  [ -n "$PLUGIN_STATE" ] && return 0
+  if command -v omarchy-plugin-list >/dev/null 2>&1; then
+    PLUGIN_STATE="$(omarchy-plugin-list --json 2>/dev/null)"
+  fi
+  [ -n "$PLUGIN_STATE" ] || PLUGIN_STATE="[]"
+}
+
+plugin_enabled() {
+  load_plugin_state
+  command -v jq >/dev/null 2>&1 || { printf ''; return; }
+  printf '%s' "$PLUGIN_STATE" |
+    jq -r --arg id "$1" '[.[] | select(.id == $id) | .enabled][0] // empty'
+}
+
+# --------------------------------------------------------------- default apps
+# Desktop entries (ids, i.e. basename incl. .desktop) that belong to an app:
+# either the id's name suffix matches the checkout name, or the entry's
+# Exec/TryExec points inside the checkout.  These are the names a "default
+# application" reference in mimeapps.list would use.
+desktop_ids_for() {
+  local dir="$1" name="$2" lower f id base bl exe
+  lower="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  for f in "$HOME_DIR"/.local/share/applications/*.desktop \
+           /usr/local/share/applications/*.desktop \
+           /usr/share/applications/*.desktop; do
+    [ -f "$f" ] || continue
+    id="$(basename "$f")"
+    base="${id%.desktop}"
+    bl="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')"
+    case "$bl" in
+      "$lower" | *."$lower") printf '%s\n' "$id"; continue ;;
+    esac
+    # Only user/local entries can point at a checkout under $HOME.
+    case "$f" in
+      "$HOME_DIR"/.local/* | /usr/local/*) ;;
+      *) continue ;;
+    esac
+    exe="$(grep -m1 -E '^(Exec|TryExec)=' "$f" 2>/dev/null)"
+    [ -n "$exe" ] || continue
+    case "$exe" in *"$dir"*) printf '%s\n' "$id" ;; esac
+  done
+}
+
+# Candidate desktop ids on stdin -> mime types they are the default for.
+mime_defaults_query() {
+  ZENGH_IDS="$(cat)" python3 - "$HOME_DIR/.config/mimeapps.list" <<'PY'
+import os, sys
+ids = {a.strip().lower() for a in os.environ.get("ZENGH_IDS", "").splitlines() if a.strip()}
+if not ids:
+    sys.exit(0)
+try:
+    lines = open(sys.argv[1]).read().splitlines()
+except OSError:
+    sys.exit(0)
+sec = None
+for ln in lines:
+    s = ln.strip()
+    if s.startswith("[") and s.endswith("]"):
+        sec = s[1:-1]
+        continue
+    if sec != "Default Applications" or "=" not in ln:
+        continue
+    k, v = ln.split("=", 1)
+    if any(t.strip().lower() in ids for t in v.split(";") if t.strip()):
+        print(k)
+PY
+}
+
+# Candidate desktop ids on stdin -> drop them from Default Applications and
+# Added Associations in mimeapps.list (backed up first).  Prints lines changed.
+mime_defaults_strip() {
+  ZENGH_IDS="$(cat)" python3 - "$HOME_DIR/.config/mimeapps.list" <<'PY'
+import os, sys, shutil
+ids = {a.strip().lower() for a in os.environ.get("ZENGH_IDS", "").splitlines() if a.strip()}
+path = sys.argv[1]
+if not ids or not os.path.exists(path):
+    print(0)
+    sys.exit(0)
+lines = open(path).read().split("\n")
+out, sec, n = [], None, 0
+for ln in lines:
+    s = ln.strip()
+    if s.startswith("[") and s.endswith("]"):
+        sec = s[1:-1]
+        out.append(ln)
+        continue
+    if sec in ("Default Applications", "Added Associations") and "=" in ln:
+        k, v = ln.split("=", 1)
+        toks = [t for t in v.split(";") if t]
+        keep = [t for t in toks if t.lower() not in ids]
+        if keep != toks:
+            n += 1
+            if not keep:
+                continue
+            out.append(k + "=" + ";".join(keep) + ";")
+            continue
+    out.append(ln)
+if n:
+    shutil.copyfile(path, path + ".zengithubupdate.bak")
+    open(path, "w").write("\n".join(out))
+print(n)
+PY
+}
+
+# Omarchy role defaults (editor/browser/terminal/agent) the app holds.
+omarchy_roles_for() {
+  local name="$1" dir="$2" f v b match
+  for f in "$HOME_DIR"/.local/state/omarchy/defaults/* \
+           "$HOME_DIR"/.config/omarchy/defaults/*; do
+    [ -f "$f" ] || continue
+    v="$(tr -d '\n' <"$f" 2>/dev/null)"
+    b="$(basename "$v")"
+    match=0
+    [ "$v" = "$name" ] && match=1
+    [ "$b" = "$name" ] && match=1
+    case "$v" in *"$dir"*) match=1 ;; esac
+    [ "$match" = "1" ] && printf 'omarchy:%s\n' "$(basename "$f")"
+  done
+}
+
+# Every Omarchy default an app currently holds (mime type or omarchy:<role>).
+app_defaults() {
+  local dir="$1" name="$2" ids
+  ids="$(desktop_ids_for "$dir" "$name" | sort -u)"
+  [ -n "$ids" ] && printf '%s\n' "$ids" | mime_defaults_query
+  omarchy_roles_for "$name" "$dir"
+}
+
+# Deactivate every Omarchy default pointing at an app (mimeapps + role files).
+deactivate_defaults() {
+  local dir="$1" name="$2" ids n f v b match
+  ids="$(desktop_ids_for "$dir" "$name" | sort -u)"
+  if [ -n "$ids" ]; then
+    n="$(printf '%s\n' "$ids" | mime_defaults_strip)"
+    [ "${n:-0}" != "0" ] && say "  deactivated $n default-application mapping(s)"
+  fi
+  for f in "$HOME_DIR"/.local/state/omarchy/defaults/* \
+           "$HOME_DIR"/.config/omarchy/defaults/*; do
+    [ -f "$f" ] || continue
+    v="$(tr -d '\n' <"$f" 2>/dev/null)"
+    b="$(basename "$v")"
+    match=0
+    [ "$v" = "$name" ] && match=1
+    [ "$b" = "$name" ] && match=1
+    case "$v" in *"$dir"*) match=1 ;; esac
+    if [ "$match" = "1" ]; then
+      rm -f "$f"
+      say "  deactivated omarchy default: $(basename "$f")"
+    fi
+  done
+}
+
+# Remove the .desktop entries that launch the app's checkout (user dir only;
+# never system files). Matching is on the path the entry launches, so an
+# unrelated entry that merely shares the app's name (an AppImage, say) stays.
+remove_desktop_entries() {
+  local dir="$1" f removed=0
+  for f in "$HOME_DIR"/.local/share/applications/*.desktop; do
+    [ -f "$f" ] || continue
+    desktop_entry_points_into "$f" "$dir" || continue
+    rm -f "$f"
+    removed=$((removed + 1))
+    say "  removed $(basename "$f")"
+  done
+  [ "$removed" = 0 ] && say "  no user desktop entries to remove"
+}
+
+# --------------------------------------------------------------- install txn
+# Apps often integrate themselves while they install: they append a binding to
+# ~/.config/hypr, drop a .desktop file, claim a mime default, tweak shell.json…
+# Removing the checkout later leaves all of that behind (a "flea" writing a
+# SUPER+SHIFT+F binding is the canonical case).  So before an install we snapshot
+# the config roots below, and on uninstall we put them back.
+TXN_ROOT="$STATE_DIR/transactions"
+
+# "<full|light> <path relative to $HOME>".  "full" roots are copied so a modified
+# or deleted file can be restored; "light" roots only track add/remove (binaries
+# are not copied).  Extra roots can be added with ZENGH_WATCH (colon separated).
+snapshot_roots() {
+  cat <<'EOF'
+full .config/hypr
+full .config/omarchy/shell.json
+full .config/omarchy/extensions
+full .config/omarchy/defaults
+full .config/mimeapps.list
+full .config/xdg-desktop-portal
+full .config/autostart
+full .config/environment.d
+full .local/share/applications
+full .local/state/omarchy/defaults
+light .local/bin
+light .cargo/bin
+light .local/share/icons
+EOF
+  [ -n "${ZENGH_WATCH:-}" ] || return 0
+  printf '%s\n' "$ZENGH_WATCH" | tr ':' '\n' | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    case "$p" in
+      "$HOME_DIR"/*) printf 'full %s\n' "${p#"$HOME_DIR"/}" ;;
+      /*) continue ;;
+      *) printf 'full %s\n' "$p" ;;
+    esac
+  done
+}
+
+app_txn_dir() { printf '%s/%s' "$TXN_ROOT" "$(sanitize_key "$1")"; }
+
+# take|commit|revert on <home> <txn-dir>.  Roots come from <txn-dir>/roots.
+zen_snapshot() {
+  python3 - "$@" <<'PY'
+import hashlib, json, os, shutil, sys
+
+def load_roots(path):
+    roots = []
+    if not os.path.exists(path):
+        return roots
+    for ln in open(path):
+        ln = ln.rstrip("\n")
+        if not ln.strip():
+            continue
+        parts = ln.split(None, 1)
+        if len(parts) == 2 and parts[0] in ("full", "light"):
+            mode, rel = parts
+        else:
+            mode, rel = "full", ln.strip()
+        rel = rel.strip().lstrip("/")
+        if rel:
+            roots.append((mode, rel))
+    return roots
+
+def digest(path):
+    if os.path.islink(path):
+        return "symlink:" + os.readlink(path)
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+def walk_root(home, mode, rel):
+    absr = os.path.join(home, rel)
+    out = []
+    if os.path.islink(absr) or os.path.isfile(absr):
+        out.append((rel, absr, mode))
+        return out
+    if not os.path.isdir(absr):
+        return out
+    for root, dirs, files in os.walk(absr):
+        for name in list(dirs):
+            p = os.path.join(root, name)
+            if os.path.islink(p):
+                dirs.remove(name)
+                out.append((os.path.relpath(p, home), p, mode))
+        for name in files:
+            p = os.path.join(root, name)
+            out.append((os.path.relpath(p, home), p, mode))
+    return out
+
+def manifest(home, roots, copies_dir=None):
+    m = {}
+    if copies_dir:
+        shutil.rmtree(copies_dir, ignore_errors=True)
+        os.makedirs(copies_dir, exist_ok=True)
+    for mode, rel in roots:
+        for rrel, absp, rmode in walk_root(home, mode, rel):
+            d = digest(absp)
+            if d is None:
+                continue
+            can_copy = (rmode == "full")
+            m[rrel] = {"h": d, "c": can_copy}
+            if can_copy and copies_dir:
+                dst = os.path.join(copies_dir, rrel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                if os.path.islink(absp):
+                    if os.path.lexists(dst):
+                        os.remove(dst)
+                    os.symlink(os.readlink(absp), dst)
+                else:
+                    shutil.copy2(absp, dst)
+    return m
+
+def restore(src, dst):
+    os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+    if os.path.lexists(dst):
+        os.remove(dst)
+    if os.path.islink(src):
+        os.symlink(os.readlink(src), dst)
+    else:
+        shutil.copy2(src, dst)
+
+cmd, home, txn = sys.argv[1], sys.argv[2], sys.argv[3]
+roots = load_roots(os.path.join(txn, "roots"))
+pre_path = os.path.join(txn, "pre.manifest.json")
+post_path = os.path.join(txn, "post.manifest.json")
+copies = os.path.join(txn, "pre")
+
+def load(path):
+    try:
+        return json.load(open(path))
+    except (OSError, ValueError):
+        return {}
+
+if cmd == "take":
+    pre = manifest(home, roots, copies)
+    json.dump(pre, open(pre_path, "w"))
+    print(len(pre))
+elif cmd == "commit":
+    post = manifest(home, roots)
+    json.dump(post, open(post_path, "w"))
+    pre = load(pre_path)
+    added = sorted(k for k in post if k not in pre)
+    modified = sorted(k for k in post if k in pre and post[k]["h"] != pre[k]["h"])
+    deleted = sorted(k for k in pre if k not in post)
+    json.dump({"added": added, "modified": modified, "deleted": deleted},
+              open(os.path.join(txn, "changes.json"), "w"))
+    print("added=%d modified=%d deleted=%d" % (len(added), len(modified), len(deleted)))
+    for k in added:
+        print("  + " + k)
+    for k in modified:
+        print("  ~ " + k)
+    for k in deleted:
+        print("  - " + k)
+elif cmd == "revert":
+    pre = load(pre_path)
+    post = load(post_path) or manifest(home, roots)
+    added = [k for k in post if k not in pre]
+    modified = [k for k in post if k in pre and post[k]["h"] != pre[k]["h"]]
+    deleted = [k for k in pre if k not in post]
+    for k in added:
+        cur = digest(os.path.join(home, k))
+        if cur == post[k]["h"]:
+            target = os.path.join(home, k)
+            if os.path.islink(target) or os.path.isfile(target):
+                os.remove(target)
+                print("removed " + k)
+        elif cur is not None:
+            print("kept    " + k + " (changed since install)")
+    for k in deleted:
+        if pre[k].get("c") and not os.path.lexists(os.path.join(home, k)):
+            src = os.path.join(copies, k)
+            if os.path.lexists(src):
+                restore(src, os.path.join(home, k))
+                print("restored " + k)
+    for k in modified:
+        cur = digest(os.path.join(home, k))
+        if cur == post[k]["h"] and pre[k].get("c"):
+            src = os.path.join(copies, k)
+            if os.path.lexists(src):
+                dst = os.path.join(home, k)
+                try:
+                    if os.path.islink(dst) or os.path.isfile(dst):
+                        shutil.copy2(dst, dst + ".zengithubupdate.revert.bak")
+                except OSError:
+                    pass
+                restore(src, dst)
+                print("reverted " + k)
+        elif cur != post[k]["h"]:
+            print("kept    " + k + " (changed since install)")
+else:
+    sys.stderr.write("zen-gh: bad snapshot command: %s\n" % cmd)
+    sys.exit(2)
+PY
+}
+
+snapshot_begin() {
+  local name="$1" txn n
+  txn="$(app_txn_dir "$name")"
+  rm -rf "$txn"
+  mkdir -p "$txn"
+  snapshot_roots >"$txn/roots"
+  n="$(zen_snapshot take "$HOME_DIR" "$txn" 2>/dev/null)"
+  [ -n "${n:-}" ] && say "  snapshot: recorded $n config file(s) to revert on uninstall"
+  return 0
+}
+
+snapshot_commit() {
+  local name="$1" txn out
+  txn="$(app_txn_dir "$name")"
+  [ -d "$txn" ] || return 0
+  out="$(zen_snapshot commit "$HOME_DIR" "$txn" 2>/dev/null)"
+  [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /' >&2
+  return 0
+}
+
+snapshot_revert() {
+  local name="$1" txn out status
+  txn="$(app_txn_dir "$name")"
+  [ -d "$txn" ] || return 1
+  say "  reverting config changes the install made:"
+  out="$(zen_snapshot revert "$HOME_DIR" "$txn" 2>&1)"
+  status=$?
+  [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/    /' >&2
+  rm -rf "$txn"
+  return "$status"
+}
+
+# ------------------------------------------------------------------- menu rows
+# The menu key for a tracked thing. Plugins keep their id; apps their name.
+menu_key() {
+  local kind="$1" name="$2" pid="$3"
+  if [ "$kind" = "plugin" ]; then
+    printf 'update.githubapps.%s' "$(sanitize_key "$pid")"
+  else
+    printf 'update.githubapps.%s' "$(sanitize_key "$name")"
+  fi
+}
+
+menu_has_key() {
+  [ -f "$MENU_FILE" ] && grep -qF "\"$1\":" "$MENU_FILE"
+}
+
+# Add or replace the update.githubapps.<key> row. Comma-safe: the row before the
+# closing brace is always given a trailing comma first, and the new row is
+# inserted last without one. Prints 1 when the row was written.
+add_menu_row() {
+  python3 - "$MENU_FILE" "$1" "$2" "$3" "$4" "$5" <<'PY'
+import sys, os, json, re
+path, key, label, description, action, icon = sys.argv[1:7]
+try:
+    text = open(path).read()
+except OSError:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    text = "{\n}\n"
+lines = text.split("\n")
+line_re = re.compile(r'^\s*"((?:[^"\\]|\\.)+)"\s*:')
+out = []
+for ln in lines:
+    m = line_re.match(ln)
+    if m and m.group(1) == key:
+        continue
+    out.append(ln)
+close = None
+for i in range(len(out) - 1, -1, -1):
+    if out[i].strip() == "}":
+        close = i
+        break
+value = json.dumps(
+    {"icon": icon, "label": label, "description": description, "action": action},
+    ensure_ascii=False,
+)
+if close is None:
+    out.append(f'  "{key}": {value}')
+    out.append("}")
+else:
+    # Make sure the previous last entry ends with a comma so the new one is valid.
+    for i in range(close - 1, -1, -1):
+        s = out[i].strip()
+        if s == "" or s.startswith("//") or s in ("{", "[") or out[i].rstrip().endswith("{") or out[i].rstrip().endswith("["):
+            continue
+        if not out[i].rstrip().endswith(","):
+            out[i] = out[i].rstrip() + ","
+        break
+    out.insert(close, f'  "{key}": {value}')
+open(path, "w").write("\n".join(out))
+print(1)
+PY
+}
+
+# Drop the given update.githubapps.<key> rows in one pass. Prints how many rows
+# were removed.
+remove_menu_rows() {
+  [ "$#" -gt 0 ] || { printf '0'; return 0; }
+  python3 - "$MENU_FILE" "$@" <<'PY'
+import sys, os, shutil, re
+path, keys = sys.argv[1], set(sys.argv[2:])
+try:
+    text = open(path).read()
+except OSError:
+    print(0)
+    sys.exit(0)
+line_re = re.compile(r'^\s*"((?:[^"\\]|\\.)+)"\s*:')
+out, removed = [], 0
+for ln in text.split("\n"):
+    m = line_re.match(ln)
+    if m and m.group(1) in keys:
+        removed += 1
+        continue
+    out.append(ln)
+if removed:
+    close = None
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].strip() == "}":
+            close = i
+            break
+    end = close if close is not None else len(out)
+    for i in range(end - 1, -1, -1):
+        s = out[i].strip()
+        if s == "" or s.startswith("//"):
+            continue
+        if out[i].rstrip().endswith(","):
+            out[i] = out[i].rstrip()[:-1]
+        break
+    shutil.copyfile(path, path + ".zengithubupdate.bak")
+    open(path, "w").write("\n".join(out))
+print(removed)
+PY
+}
+
+# Single-key form, kept for the uninstall/remove paths.
+remove_menu_row() { remove_menu_rows "${1:-}"; }
+
+# Keys zen-gh owns right now: a row for every tracked app checkout and every
+# installed plugin (the same discovery cmd_sync_menu adds rows from).
+menu_live_keys() {
+  local dir path name id
+  for dir in "$HOME_DIR"/*/; do
+    path="${dir%/}"
+    name="$(basename "$path")"
+    case "$name" in .*) continue ;; esac
+    ignored "$name" && continue
+    is_link_target "$path" && continue
+    [ -d "$path/.git" ] || continue
+    [ -n "$(github_slug "$(origin_url "$path")")" ] || continue
+    menu_key app "$name" ""
+    printf '\n'
+  done
+  for dir in "$PLUGINS_DIR"/*/; do
+    path="${dir%/}"
+    [ -d "$path" ] || continue
+    [ -f "$path/manifest.json" ] || continue
+    id="$(plugin_field "$path" id)"
+    [ -n "$id" ] || continue
+    [ "$id" = "$SELF_ID" ] && continue
+    menu_key plugin "" "$id"
+    printf '\n'
+  done
+}
+
+# Drop zen-gh's own rows whose app/plugin is gone. Rows it did not generate (a
+# different icon or action, e.g. the craft-update entries) are never touched:
+# those are curated by hand. This is what clears the stale button after an app
+# or plugin is removed by something other than `zen-gh uninstall` (Omarchy's own
+# plugin manager, a manual `rm`, …). Prints how many rows were dropped.
+prune_menu_rows() {
+  local live
+  live="$(menu_live_keys)"
+  python3 - "$MENU_FILE" "$APP_ICON" "$PLUGIN_ICON" "$live" <<'PY'
+import sys, os, shutil, re
+path, app_icon, plugin_icon, live = sys.argv[1:5]
+live = {k for k in live.split("\n") if k}
+try:
+    text = open(path).read()
+except OSError:
+    print(0)
+    sys.exit(0)
+line_re = re.compile(r'^\s*"((?:[^"\\]|\\.)+)"\s*:')
+action_re = re.compile(r'"action"\s*:\s*"zen-gh update ([^"\\]+)"')
+icons = ('"' + app_icon + '"', '"' + plugin_icon + '"')
+out, removed = [], []
+for ln in text.split("\n"):
+    m = line_re.match(ln)
+    if m:
+        key = m.group(1)
+        if (key.startswith("update.githubapps.") and action_re.search(ln)
+                and any(i in ln for i in icons) and key not in live):
+            removed.append(key)
+            continue
+    out.append(ln)
+if removed:
+    close = None
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].strip() == "}":
+            close = i
+            break
+    end = close if close is not None else len(out)
+    for i in range(end - 1, -1, -1):
+        s = out[i].strip()
+        if s == "" or s.startswith("//"):
+            continue
+        if out[i].rstrip().endswith(","):
+            out[i] = out[i].rstrip()[:-1]
+        break
+    shutil.copyfile(path, path + ".zengithubupdate.bak")
+    open(path, "w").write("\n".join(out))
+    for key in removed:
+        sys.stderr.write(key + "\n")
+print(len(removed))
+PY
+}
+
+# Add a menu row for every tracked app/plugin that does not have one yet, then
+# drop rows whose target is gone. Never touches rows you curated yourself (so the
+# craft-update entries are left alone).
+cmd_sync_menu() {
+  local dir path name id label slug key added=0 pruned
+  for dir in "$HOME_DIR"/*/; do
+    path="${dir%/}"
+    name="$(basename "$path")"
+    case "$name" in .*) continue ;; esac
+    ignored "$name" && continue
+    is_link_target "$path" && continue
+    [ -d "$path/.git" ] || continue
+    slug="$(github_slug "$(origin_url "$path")")"
+    [ -n "$slug" ] || continue
+    key="$(menu_key app "$name" "")"
+    menu_has_key "$key" && continue
+    label="$(prettify "$name")"
+    add_menu_row "$key" "$label" "$slug" "zen-gh update $name" "$APP_ICON" >/dev/null && added=$((added + 1))
+  done
+  for dir in "$PLUGINS_DIR"/*/; do
+    path="${dir%/}"
+    [ -d "$path" ] || continue
+    [ -f "$path/manifest.json" ] || continue
+    id="$(plugin_field "$path" id)"
+    [ -n "$id" ] || continue
+    [ "$id" = "$SELF_ID" ] && continue
+    key="$(menu_key plugin "" "$id")"
+    menu_has_key "$key" && continue
+    label="$(plugin_field "$path" name)"
+    [ -n "$label" ] || label="$id"
+    add_menu_row "$key" "$label" "$id" "zen-gh update $id" "$PLUGIN_ICON" >/dev/null && added=$((added + 1))
+  done
+  [ "$added" -gt 0 ] && say "Added $added menu row(s)."
+  pruned="$(prune_menu_rows 2>/dev/null)"
+  [ "${pruned:-0}" -gt 0 ] && say "Removed $pruned stale menu row(s)."
+  return 0
+}
+
+
+# ------------------------------------------------------------------ discovery
+# One tab-separated row for an app checkout, or non-zero if not a github repo.
+app_row() {
+  local dir="$1" src="${2:-}" remote slug name branch version commit behind build defs manifest
+  [ -n "$src" ] && [ -d "$src" ] && dir="$src"
+  [ -d "$dir/.git" ] || return 1
+  remote="$(origin_url "$dir")" || return 1
+  slug="$(github_slug "$remote")"
+  [ -n "$slug" ] || return 1
+  name="$(basename "$dir")"
+  branch="$(git -C "$dir" symbolic-ref --short -q HEAD 2>/dev/null)"
+  [ -n "$branch" ] || branch="?"
+  version="$(git -C "$dir" describe --tags --always 2>/dev/null)"
+  commit="$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)"
+  behind="$(behind_count "$dir" "$branch")"
+  build="$(build_tool "$dir")"
+  manifest="$(manifest_version "$dir")"
+  defs="$(app_defaults "$dir" "$name" | paste -sd'|' -)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$name" "$dir" "$slug" "$remote" "$branch" "$version" "$commit" "$behind" \
+    "$build" "$defs" "$manifest" "app" "$name" "" ""
+}
+
+# One tab-separated row for an Omarchy shell plugin in the plugins dir.
+plugin_row() {
+  local dir="$1" src="${2:-}" id label name branch remote slug version commit behind mver enabled gh_dir linked
+  [ -f "$dir/manifest.json" ] || return 1
+  id="$(plugin_field "$dir" id)"
+  [ -n "$id" ] || return 1
+  name="$id"
+  label="$(plugin_field "$dir" name)"
+  [ -n "$label" ] || label="$id"
+  mver="$(plugin_field "$dir" version)"
+  linked="false"
+  if [ -n "$src" ] && [ -d "$src" ]; then
+    linked="true"
+  else
+    src=""
+  fi
+  # Version/label stay from the installed copy; git facts come from the linked
+  # source when it is a checkout.
+  gh_dir="$dir"
+  [ -n "$src" ] && [ -d "$src/.git" ] && gh_dir="$src"
+  if [ -d "$gh_dir/.git" ]; then
+    remote="$(origin_url "$gh_dir")"
+    slug="$(github_slug "$remote")"
+    branch="$(git -C "$gh_dir" symbolic-ref --short -q HEAD 2>/dev/null)"
+    [ -n "$branch" ] || branch="?"
+    version="$(git -C "$gh_dir" describe --tags --always 2>/dev/null)"
+    commit="$(git -C "$gh_dir" rev-parse --short HEAD 2>/dev/null)"
+    behind="$(behind_count "$gh_dir" "$branch")"
+  else
+    remote=""
+    slug=""
+    branch="?"
+    version="$mver"
+    commit=""
+    behind=0
+  fi
+  enabled="$(plugin_enabled "$id")"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$name" "${src:-$dir}" "$slug" "$remote" "$branch" "$version" "$commit" "$behind" \
+    "" "" "$mver" "plugin" "$label" "$id" "$enabled" "$linked"
+}
+
+resolve_target() {
+  local q="$1" dir id nm src
+  for dir in "$HOME_DIR"/*/; do
+    [ -d "${dir%/}/.git" ] || continue
+    [ "$(basename "${dir%/}")" = "$q" ] && {
+      src="$(link_for "$(basename "${dir%/}")")"
+      [ -n "$src" ] || src="${dir%/}"
+      printf 'app\t%s\t\t%s' "$src" "$(basename "${dir%/}")"
+      return 0
+    }
+  done
+  for dir in "$PLUGINS_DIR"/*/; do
+    [ -d "${dir%/}" ] || continue
+    id="$(plugin_field "${dir%/}" id)"
+    nm="$(basename "${dir%/}")"
+    src="$(link_for "$id")"
+    [ -n "$src" ] || src="$(link_for "$nm")"
+    [ -n "$src" ] || src="${dir%/}"
+    if [ "$id" = "$q" ] || [ "$nm" = "$q" ]; then
+      printf 'plugin\t%s\t%s\t%s' "$src" "$id" "$id"
+      return 0
+    fi
+    nm="$(plugin_field "${dir%/}" name)"
+    [ -n "$nm" ] && [ "$nm" = "$q" ] && {
+      printf 'plugin\t%s\t%s\t%s' "$src" "$id" "$id"
+      return 0
+    }
+  done
+  return 1
+}
+
+tsv_to_json() {
+  python3 -c '
+import sys, json
+rows = []
+for ln in sys.stdin.read().splitlines():
+    if not ln.strip():
+        continue
+    p = ln.split("\t")
+    if len(p) < 9:
+        continue
+    rows.append({
+        "name": p[0], "path": p[1], "slug": p[2], "remote": p[3],
+        "branch": p[4], "version": p[5], "commit": p[6],
+        "behind": int(p[7]) if p[7].isdigit() else 0, "build": p[8],
+        "defaults": [d for d in (p[9].split("|") if len(p) > 9 else []) if d],
+        "manifest": p[10] if len(p) > 10 else "",
+        "kind": p[11] if len(p) > 11 else "app",
+        "label": p[12] if len(p) > 12 else "",
+        "pluginId": p[13] if len(p) > 13 else "",
+        "enabled": (p[14] == "true") if len(p) > 14 else False,
+        "linked": (p[15] == "true") if len(p) > 15 else False,
+    })
+rows.sort(key=lambda r: (r["kind"] != "app", r["name"].lower()))
+print(json.dumps(rows))
+'
+}
+
+# The version an app declares in its own manifest (Cargo.toml, package.json or
+# pyproject.toml), so every checkout shows a real version even without git
+# tags. Empty for anything without a versioned manifest (e.g. go.mod).
+manifest_version() {
+  python3 - "$1" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+
+def toml(path):
+    import tomllib
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        return {}
+
+def emit(value):
+    if isinstance(value, str) and value:
+        print(value, end="")
+        sys.exit(0)
+
+cargo = os.path.join(d, "Cargo.toml")
+if os.path.isfile(cargo):
+    t = toml(cargo)
+    emit((t.get("package") or {}).get("version"))
+    emit((t.get("workspace", {}).get("package") or {}).get("version"))
+
+pkg = os.path.join(d, "package.json")
+if os.path.isfile(pkg):
+    try:
+        emit(json.load(open(pkg)).get("version"))
+    except Exception:
+        pass
+
+pyproject = os.path.join(d, "pyproject.toml")
+if os.path.isfile(pyproject):
+    t = toml(pyproject)
+    emit((t.get("project") or {}).get("version"))
+    emit((t.get("tool", {}).get("poetry") or {}).get("version"))
+PY
+}
+
+# -------------------------------------------------------------------- commands
+cmd_list() {
+  local fetch="" sync="" a dir path name src
+  for a in "$@"; do
+    case "$a" in
+      --fetch) fetch=1 ;;
+      --sync-menu) sync=1 ;;
+    esac
+  done
+  load_plugin_state
+  {
+    for dir in "$HOME_DIR"/*/; do
+      path="${dir%/}"
+      name="$(basename "$path")"
+      case "$name" in .*) continue ;; esac
+      ignored "$name" && continue
+      is_link_target "$path" && continue
+      [ "$fetch" = "1" ] && [ -d "$path/.git" ] &&
+        github_slug "$(origin_url "$path")" | grep -q . &&
+        fetch_origin "$path"
+      src="$(link_for "$name")"
+      [ -n "$src" ] && [ -d "$src/.git" ] || src=""
+      app_row "$path" "$src" || true
+    done
+    for dir in "$PLUGINS_DIR"/*/; do
+      path="${dir%/}"
+      [ -d "$path" ] || continue
+      [ "$(basename "$path")" = "$SELF_ID" ] && continue
+      ignored "$(basename "$path")" && continue
+      [ "$fetch" = "1" ] && [ -d "$path/.git" ] &&
+        fetch_origin "$path"
+      src="$(link_for "$(plugin_field "$path" id)")"
+      [ -n "$src" ] || src="$(link_for "$(basename "$path")")"
+      plugin_row "$path" "$src" || true
+    done
+  } | tsv_to_json
+  [ "$sync" = "1" ] && cmd_sync_menu >/dev/null 2>&1
+  return 0
+}
+
+cmd_add() {
+  local arg="" no_install=0 a slug url name stage id target section
+  for a in "$@"; do
+    case "$a" in
+      --no-install) no_install=1 ;;
+      *) [ -z "$arg" ] && arg="$a" ;;
+    esac
+  done
+  [ -n "$arg" ] || die "give a github URL or owner/repo"
+  case "$arg" in
+    http*|git@*|ssh://*) slug="$(github_slug "$arg")"; url="$arg" ;;
+    */*)                 slug="$(github_slug "$arg")"; url="https://github.com/$slug.git" ;;
+    *)                   die "give a github URL or owner/repo (got: $arg)" ;;
+  esac
+  [ -n "$slug" ] || die "not a github url: $arg"
+  name="${slug##*/}"
+
+  stage="$STATE_DIR/.stage.$$"
+  rm -rf "$stage"
+  say "Cloning $slug…"
+  git clone "$url" "$stage" || { rm -rf "$stage"; die "clone failed"; }
+
+  if is_plugin_dir "$stage"; then
+    id="$(plugin_field "$stage" id)"
+    [ -n "$id" ] || { rm -rf "$stage"; die "plugin manifest has no id"; }
+    target="$PLUGINS_DIR/$id"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      rm -rf "$stage"
+      die "plugin '$id' is already installed"
+    fi
+    if command -v omarchy-plugin-validate >/dev/null 2>&1 &&
+      ! omarchy-plugin-validate "$stage" >/dev/null 2>&1; then
+      rm -rf "$stage"
+      die "refusing to add: plugin validation failed"
+    fi
+    mkdir -p "$PLUGINS_DIR"
+    mv "$stage" "$target"
+    rescan_plugins
+    if command -v omarchy-plugin-enable >/dev/null 2>&1; then
+      section="$(plugin_field "$target" barWidget.defaultSection)"
+      [ -n "$section" ] || section="right"
+      omarchy-plugin-enable "$id" --section "$section" >/dev/null 2>&1 || true
+    fi
+    cmd_sync_menu || true
+    say "Installed Omarchy plugin '$id'."
+    return 0
+  fi
+
+  dest="$HOME_DIR/$name"
+  if [ -e "$dest" ]; then
+    rm -rf "$stage"
+    die "$dest already exists"
+  fi
+  mv "$stage" "$dest"
+  # The menu row goes in before any build runs: a cargo build can take minutes,
+  # and the button must exist as soon as the app is tracked (an install that is
+  # interrupted must not leave the app without its row).
+  cmd_sync_menu || true
+  if [ "$no_install" = "0" ]; then
+    snapshot_begin "$name"
+    install_app "$dest" || say "!! install step failed; review the output above"
+    snapshot_commit "$name"
+  fi
+  # Again afterwards: an install script can add plugins or new checkouts.
+  cmd_sync_menu || true
+  say "Installed $name at $dest"
+}
+
+cmd_update() {
+  local arg="${1:-}" resolved kind path pid name out
+  [ -n "$arg" ] || die "which app?"
+  resolved="$(resolve_target "$arg")" || die "not tracked: $arg"
+  kind="$(printf '%s' "$resolved" | cut -f1)"
+  path="$(printf '%s' "$resolved" | cut -f2)"
+  pid="$(printf '%s' "$resolved" | cut -f3)"
+  name="$(printf '%s' "$resolved" | cut -f4)"
+  say "==> $name ($path)"
+  if [ "$kind" = "plugin" ]; then
+    if [ -d "$path/.git" ]; then
+      fetch_origin "$path"
+      if ! out="$(git -C "$path" pull --ff-only 2>&1)"; then
+        say "!! git pull failed for $name: $out"
+        return 1
+      fi
+      say "  $out"
+    else
+      say "-- not a git checkout; nothing to pull"
+    fi
+    # A linked source folder ships its own installer: re-run it so the
+    # installed plugin picks up whatever changed there.
+    if [ -f "$path/install.sh" ] || [ -f "$path/setup.sh" ] || [ -f "$path/scripts/install.sh" ]; then
+      say "-- reinstalling from $path"
+      install_app "$path" || { say "!! install step failed for $name"; return 1; }
+    fi
+    rescan_plugins
+    say "==> $name done"
+    return 0
+  fi
+  fetch_origin "$path"
+  if ! out="$(git -C "$path" pull --ff-only 2>&1)"; then
+    say "!! git pull failed for $name: $out"
+    return 1
+  fi
+  case "$out" in
+    *[Aa]lready[[:space:]]up[[:space:]]to[[:space:]]date*)
+      say "-- $name already up to date; nothing to rebuild"
+      ;;
+    *)
+      say "  pulled: $out"
+      build_app "$path" || { say "!! build failed for $name"; return 1; }
+      ;;
+  esac
+  # Keep the launcher button pointing at the rebuilt binary, and create it for
+  # checkouts that were installed before launcher entries existed.
+  install_launcher_entry "$path"
+  say "==> $name done"
+}
+
+cmd_update_all() {
+  local dir path name behind branch updated=0 failed=0
+  for dir in "$HOME_DIR"/*/ "$PLUGINS_DIR"/*/; do
+    path="${dir%/}"
+    name="$(basename "$path")"
+    case "$name" in .*) continue ;; esac
+    ignored "$name" && continue
+    is_link_target "$path" && continue
+    [ -d "$path/.git" ] || continue
+    github_slug "$(origin_url "$path")" | grep -q . || continue
+    fetch_origin "$path"
+    branch="$(git -C "$path" symbolic-ref --short -q HEAD 2>/dev/null)"
+    behind="$(behind_count "$path" "$branch")"
+    if [ "${behind:-0}" = "0" ]; then
+      say "-- $name is up to date; skipping"
+      continue
+    fi
+    if cmd_update "$name"; then
+      updated=$((updated + 1))
+    else
+      failed=$((failed + 1))
+    fi
+  done
+  # Linked source folders update through their tracked name, so a linked plugin
+  # also re-runs its install steps after the pull.
+  if [ -s "$LINKS_FILE" ]; then
+    while IFS=$'\t' read -r name path; do
+      [ -n "$name" ] && [ -d "$path/.git" ] || continue
+      github_slug "$(origin_url "$path")" | grep -q . || continue
+      branch="$(git -C "$path" symbolic-ref --short -q HEAD 2>/dev/null)"
+      behind="$(behind_count "$path" "$branch")"
+      if [ "${behind:-0}" = "0" ]; then
+        say "-- $name is up to date; skipping"
+        continue
+      fi
+      if cmd_update "$name"; then
+        updated=$((updated + 1))
+      else
+        failed=$((failed + 1))
+      fi
+    done <"$LINKS_FILE"
+  fi
+  say "==> $updated updated, $failed failed"
+  [ "$failed" -eq 0 ]
+}
+
+cmd_install() {
+  local arg="${1:-}" resolved kind path
+  [ -n "$arg" ] || die "which app?"
+  resolved="$(resolve_target "$arg")" || die "not tracked: $arg"
+  kind="$(printf '%s' "$resolved" | cut -f1)"
+  path="$(printf '%s' "$resolved" | cut -f2)"
+  if [ "$kind" = "plugin" ]; then
+    if [ -f "$path/install.sh" ] || [ -f "$path/setup.sh" ] || [ -f "$path/scripts/install.sh" ]; then
+      install_app "$path"
+      return 0
+    fi
+    say "-- '$arg' is an Omarchy plugin; run: omarchy plugin update $arg"
+    return 0
+  fi
+  install_app "$path"
+}
+
+cmd_ignore() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "which app?"
+  ignored "$name" || printf '%s\n' "$name" >>"$IGNORE_FILE"
+  say "Hid $name (files kept)."
+}
+
+cmd_unignore() {
+  local name="${1:-}" tmp
+  [ -n "$name" ] || die "which app?"
+  tmp="$(mktemp)"
+  grep -Fxv "$name" "$IGNORE_FILE" >"$tmp" 2>/dev/null || :
+  mv "$tmp" "$IGNORE_FILE"
+  say "Restored $name."
+}
+
+# Link a tracked name to the folder that actually holds its source. The panel's
+# Update action then runs that folder's install steps (after a git pull when the
+# folder is a checkout) instead of looking for a checkout under $HOME.
+cmd_link() {
+  local name="${1:-}" target="${2:-}" abs key tmp
+  [ -n "$name" ] && [ -n "$target" ] || die "usage: zen-gh link <name> <folder>"
+  [ -d "$target" ] || die "not a folder: $target"
+  abs="$(cd "$target" && pwd -P)" || die "cannot read: $target"
+  key="$(canonical_name "$name")"
+  mkdir -p "$STATE_DIR"
+  tmp="$LINKS_FILE.tmp.$$"
+  : >"$tmp"
+  [ -f "$LINKS_FILE" ] && awk -F'\t' -v k="$key" '$1 != k' "$LINKS_FILE" >"$tmp"
+  printf '%s\t%s\n' "$key" "$abs" >>"$tmp"
+  sort -o "$tmp" "$tmp"
+  mv "$tmp" "$LINKS_FILE"
+  say "Linked $key -> $abs"
+  if [ ! -d "$PLUGINS_DIR/$key" ] && [ ! -d "$HOME_DIR/$key" ]; then
+    say "-- note: '$key' is not tracked yet; the link applies once it is"
+  fi
+}
+
+cmd_unlink() {
+  local name="${1:-}" key tmp
+  [ -n "$name" ] || die "which link?"
+  [ -s "$LINKS_FILE" ] || { say "No links."; return 0; }
+  if [ -n "$(link_for "$name")" ]; then
+    key="$name"
+  else
+    key="$(canonical_name "$name")"
+  fi
+  tmp="$LINKS_FILE.tmp.$$"
+  awk -F'\t' -v k="$key" '$1 != k' "$LINKS_FILE" >"$tmp"
+  if cmp -s "$tmp" "$LINKS_FILE"; then
+    rm -f "$tmp"
+    say "No link for $key."
+    return 0
+  fi
+  mv "$tmp" "$LINKS_FILE"
+  say "Unlinked $key."
+}
+
+cmd_links() {
+  local name path
+  if [ ! -s "$LINKS_FILE" ]; then
+    say "No links."
+    return 0
+  fi
+  while IFS=$'\t' read -r name path; do
+    [ -n "$name" ] && printf '%s -> %s\n' "$name" "$path"
+  done <"$LINKS_FILE"
+}
+
+cmd_defaults() {
+  local arg="${1:-}" resolved kind path name
+  [ -n "$arg" ] || die "which app?"
+  resolved="$(resolve_target "$arg")" || die "not tracked: $arg"
+  kind="$(printf '%s' "$resolved" | cut -f1)"
+  path="$(printf '%s' "$resolved" | cut -f2)"
+  name="$(printf '%s' "$resolved" | cut -f4)"
+  [ "$kind" = "plugin" ] && return 0
+  app_defaults "$path" "$name"
+}
+
+cmd_launcher() {
+  local arg="${1:-}" resolved path
+  [ -n "$arg" ] || die "which app?"
+  resolved="$(resolve_target "$arg")" || die "not tracked: $arg"
+  path="$(printf '%s' "$resolved" | cut -f2)"
+  install_launcher_entry "$path"
+}
+
+cmd_remove() {
+  local arg="${1:-}" resolved kind path pid name
+  [ -n "$arg" ] || die "which app?"
+  resolved="$(resolve_target "$arg")" || die "not tracked: $arg"
+  kind="$(printf '%s' "$resolved" | cut -f1)"
+  path="$(printf '%s' "$resolved" | cut -f2)"
+  pid="$(printf '%s' "$resolved" | cut -f3)"
+  name="$(printf '%s' "$resolved" | cut -f4)"
+  say "==> Removing $name"
+  if [ "$kind" = "plugin" ]; then
+    remove_plugin "$path" "$pid"
+  else
+    deactivate_defaults "$path" "$name"
+  fi
+  ignored "$name" || printf '%s\n' "$name" >>"$IGNORE_FILE"
+  remove_menu_row "$(menu_key "$kind" "$name" "$pid")" >/dev/null
+  prune_menu_rows >/dev/null
+  say "==> $name removed (files kept)."
+}
+
+remove_plugin() {
+  local path="$1" id="$2" enabled backup n
+  enabled="$(plugin_enabled "$id")"
+  if [ "$enabled" = "true" ] && command -v omarchy-shell >/dev/null 2>&1; then
+    omarchy-shell shell setPluginEnabled "$id" false >/dev/null 2>&1 || true
+  fi
+  if [ -L "$path" ]; then
+    rm -f "$path"
+    say "  unlinked $id"
+  elif [ -d "$path/.git" ]; then
+    rm -rf -- "$path"
+    say "  deleted $path"
+  else
+    backup="$PLUGINS_DIR/.${id}.bak.$(date -u +%Y%m%d%H%M%S)"
+    n=1
+    while [ -e "$backup" ]; do
+      backup="${backup}-${n}"
+      n=$((n + 1))
+    done
+    mv "$path" "$backup" || die "failed to back up $path"
+    say "  backed up to $backup"
+  fi
+  rescan_plugins
+}
+
+cmd_uninstall() {
+  local assume=0 a arg="" ans resolved kind path pid name rows
+  for a in "$@"; do
+    case "$a" in
+      --yes|-y) assume=1 ;;
+      *) [ -z "$arg" ] && arg="$a" ;;
+    esac
+  done
+  [ -n "$arg" ] || die "which app?"
+  resolved="$(resolve_target "$arg")" || die "not tracked: $arg"
+  kind="$(printf '%s' "$resolved" | cut -f1)"
+  path="$(printf '%s' "$resolved" | cut -f2)"
+  pid="$(printf '%s' "$resolved" | cut -f3)"
+  name="$(printf '%s' "$resolved" | cut -f4)"
+  case "$path" in
+    "$HOME_DIR"/?*) ;;
+    *) die "refusing: '$path' is not under \$HOME" ;;
+  esac
+  [ "$path" != "$HOME_DIR" ] || die "refusing: bad target"
+
+  say "Uninstall '$name':"
+  if [ "$kind" = "plugin" ]; then
+    say "  • disable and remove the Omarchy plugin ($pid)"
+  else
+    [ -d "$path/.git" ] || die "refusing: '$path' is not a git checkout"
+    say "  • revert the config its install changed (bindings, defaults, .desktop)"
+    say "  • delete the checkout: $path"
+  fi
+  say "  • remove its row from the Omarchy menu"
+
+  if [ "$assume" != "1" ] && [ "${ZENGH_YES:-}" != "1" ]; then
+    if [ -t 0 ]; then
+      printf 'Proceed? [y/N] ' >&2
+      read -r ans
+      case "$ans" in y | Y | yes | YES) ;; *) say "Cancelled."; return 0 ;; esac
+    else
+      die "not an interactive terminal; re-run with --yes to confirm"
+    fi
+  fi
+
+  if [ "$kind" = "plugin" ]; then
+    case "$path" in
+      "$PLUGINS_DIR"/*) remove_plugin "$path" "$pid" ;;
+      *)
+        # The resolved path is a linked source folder: remove the installed
+        # copy and leave the folder itself alone.
+        remove_plugin "$PLUGINS_DIR/$pid" "$pid"
+        say "  kept linked source: $path"
+        ;;
+    esac
+  else
+    if [ "$path" != "$HOME_DIR/$name" ] && [ -n "$(link_for "$name")" ]; then
+      die "refusing: '$name' is linked to $path; run 'zen-gh unlink $name' first"
+    fi
+    if ! snapshot_revert "$name"; then
+      deactivate_defaults "$path" "$name"
+      remove_desktop_entries "$path"
+    fi
+    say "  deleting $path"
+    rm -rf -- "$path"
+    # Entries made after the install snapshot (e.g. by `zen-gh launcher`, or by a
+    # later update) are not in the transaction, so take them away explicitly.
+    remove_launcher_entry "$path"
+  fi
+  rows="$(remove_menu_row "$(menu_key "$kind" "$name" "$pid")")"
+  say "  removed ${rows:-0} menu row(s)"
+  # Catch any other row that pointed at this app/plugin (e.g. one added under a
+  # different name), so no dead button is left behind.
+  prune_menu_rows >/dev/null
+  cmd_unignore "$name" >/dev/null 2>&1 || true
+  [ -n "$pid" ] && cmd_unlink "$pid" >/dev/null 2>&1
+  [ -n "$name" ] && cmd_unlink "$name" >/dev/null 2>&1
+  say "==> $name uninstalled."
+}
+
+case "${1:-list-json}" in
+  list-json)  shift; cmd_list "$@" ;;
+  add)        shift; cmd_add "$@" ;;
+  update)     shift; cmd_update "${1:-}" ;;
+  update-all) shift; cmd_update_all ;;
+  install)    shift; cmd_install "${1:-}" ;;
+  defaults)   shift; cmd_defaults "${1:-}" ;;
+  remove)     shift; cmd_remove "${1:-}" ;;
+  uninstall)  shift; cmd_uninstall "$@" ;;
+  ignore)     shift; cmd_ignore "${1:-}" ;;
+  unignore)   shift; cmd_unignore "${1:-}" ;;
+  link)       shift; cmd_link "${1:-}" "${2:-}" ;;
+  unlink)     shift; cmd_unlink "${1:-}" ;;
+  links)      shift; cmd_links ;;
+  launcher)   shift; cmd_launcher "${1:-}" ;;
+  sync-menu)  shift; cmd_sync_menu ;;
+  *)          die "unknown command: ${1:-}" ;;
+esac
