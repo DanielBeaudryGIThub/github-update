@@ -2,11 +2,13 @@
   "schemaVersion": 1,
   "id": "github-update",
   "name": "GitHub Update",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": "DanielBeaudryGIThub",
   "license": "MIT",
   "description": "A rabbit in the bar: auto-discovers your local GitHub checkouts, tracks their versions, and updates or forgets them from one panel. Paste a GitHub URL to install a new project.",
-  "kinds": ["bar-widget"],
+  "kinds": [
+    "bar-widget"
+  ],
   "activation": "on-demand",
   "entryPoints": {
     "barWidget": "Panel.qml"
@@ -15,7 +17,11 @@
     "displayName": "GitHub Update",
     "description": "Track, update and install GitHub projects.",
     "category": "System",
-    "aliases": ["github", "github-update", "updates"],
+    "aliases": [
+      "github",
+      "github-update",
+      "updates"
+    ],
     "allowMultiple": false,
     "defaultSection": "right"
   }
