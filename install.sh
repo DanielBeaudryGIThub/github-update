@@ -138,9 +138,9 @@ if changed:
         out += "\n"
     with open(path, "w") as fh:
         fh.write(out)
-    say "updated the main menu (GitHub Update row)"
+    print("  updated the main menu (GitHub Update row)")
 else:
-    say "main menu already set up (GitHub Update row)"
+    print("  main menu already set up (GitHub Update row)")
 PY
 else
   say "no menu file found — skip the Super+Space entry"
