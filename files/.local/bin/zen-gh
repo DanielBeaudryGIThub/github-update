@@ -40,7 +40,7 @@
 set -uo pipefail
 
 HOME_DIR="${HOME:?HOME is not set}"
-STATE_DIR="$HOME_DIR/.config/omarchy/zengithubupdate"
+STATE_DIR="$HOME_DIR/.config/omarchy/github-update"
 IGNORE_FILE="$STATE_DIR/ignored"
 LINKS_FILE="$STATE_DIR/links"
 PLUGINS_DIR="$HOME_DIR/.config/omarchy/plugins"
@@ -545,7 +545,7 @@ for ln in lines:
             continue
     out.append(ln)
 if n:
-    shutil.copyfile(path, path + ".zengithubupdate.bak")
+    shutil.copyfile(path, path + ".github-update.bak")
     open(path, "w").write("\n".join(out))
 print(n)
 PY
@@ -801,7 +801,7 @@ elif cmd == "revert":
                 dst = os.path.join(home, k)
                 try:
                     if os.path.islink(dst) or os.path.isfile(dst):
-                        shutil.copy2(dst, dst + ".zengithubupdate.revert.bak")
+                        shutil.copy2(dst, dst + ".github-update.revert.bak")
                 except OSError:
                     pass
                 restore(src, dst)
@@ -942,7 +942,7 @@ if removed:
         if out[i].rstrip().endswith(","):
             out[i] = out[i].rstrip()[:-1]
         break
-    shutil.copyfile(path, path + ".zengithubupdate.bak")
+    shutil.copyfile(path, path + ".github-update.bak")
     open(path, "w").write("\n".join(out))
 print(removed)
 PY
@@ -1022,7 +1022,7 @@ if removed:
         if out[i].rstrip().endswith(","):
             out[i] = out[i].rstrip()[:-1]
         break
-    shutil.copyfile(path, path + ".zengithubupdate.bak")
+    shutil.copyfile(path, path + ".github-update.bak")
     open(path, "w").write("\n".join(out))
     for key in removed:
         sys.stderr.write(key + "\n")

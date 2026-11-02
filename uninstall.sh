@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # GitHub Update — remove the plugin and the zen-gh helper.
 #
-# The tracked app state (~/.config/omarchy/zengithubupdate) is kept unless you
+# The tracked app state (~/.config/omarchy/github-update) is kept unless you
 # pass --purge, so a reinstall keeps your ignored/links/transactions.
 set -euo pipefail
 
@@ -18,10 +18,10 @@ rm -rf "$HOME/.config/omarchy/plugins/$LEGACY_ID"
 rm -f "$HOME/.local/bin/zen-gh"
 
 if [ "$PURGE" = 1 ]; then
-  rm -rf "$HOME/.config/omarchy/zengithubupdate"
+  rm -rf "$HOME/.config/omarchy/github-update"
   echo "  removed tracked app state"
 else
-  echo "  kept tracked app state: ~/.config/omarchy/zengithubupdate"
+  echo "  kept tracked app state: ~/.config/omarchy/github-update"
 fi
 
 if [ -f "$SHELL_JSON" ]; then

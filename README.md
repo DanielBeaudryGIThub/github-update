@@ -85,7 +85,7 @@ zen-gh uninstall <name|id>  # revert config, drop defaults/.desktop/checkout/row
 zen-gh sync-menu            # add missing menu rows, prune stale ones
 ```
 
-Tracked state lives in `~/.config/omarchy/zengithubupdate` (ignored/links and
+Tracked state lives in `~/.config/omarchy/github-update` (ignored/links and
 install transactions for safe rollback).
 
 ## Uninstall
