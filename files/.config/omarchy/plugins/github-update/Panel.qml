@@ -117,16 +117,12 @@ Panel {
     Qt.openUrlExternally("https://github.com/" + slug)
   }
 
-  // Launch an app through its launcher entry (created first if it is missing).
+  // Launch an app through its launcher entry, or open a plugin's panel.
   function launchApp(app) {
     if (!app) return
-    if (app.kind === "plugin") {
-      statusText = displayName(app) + " is a plugin, not an app"
-      return
-    }
     if (bar && typeof bar.run === "function")
       bar.run("zen-gh launch " + shellQuote(app.name))
-    statusText = "Launching " + displayName(app) + "…"
+    statusText = (app.kind === "plugin" ? "Opening " : "Launching ") + displayName(app) + "…"
   }
 
   function runInTerminal(command) {
@@ -460,7 +456,7 @@ Panel {
                 readonly property bool selected: index === root.selectedIndex
                 readonly property int behind: Number(modelData.behind) > 0 ? Number(modelData.behind) : 0
                 readonly property bool linked: modelData.linked === true
-                readonly property bool launchable: modelData.kind === "app" && String(modelData.launch || "") !== ""
+                readonly property bool launchable: String(modelData.launch || "") !== ""
                 readonly property string sourcePath: String(modelData.path || "").replace(/^\/home\/[^\/]+/, "~")
                 readonly property var defaults: modelData.defaults || []
                 // Declared version from the app's manifest, with the checked-out
@@ -506,9 +502,8 @@ Panel {
                   PanelActionButton {
                     id: playButton
                     iconText: root.glyphPlay
-                    visible: row.modelData.kind === "app"
                     tooltipText: row.launchable
-                      ? "Launch " + root.displayName(row.modelData)
+                      ? (row.modelData.kind === "plugin" ? "Open " : "Launch ") + root.displayName(row.modelData)
                       : "No launcher entry for " + root.displayName(row.modelData) + " yet"
                     foreground: root.foreground
                     hoverColor: root.accent

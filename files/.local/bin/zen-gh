@@ -29,7 +29,7 @@
 #   zen-gh launcher <name|id>                 (re)register an app's built binary
 #                                             as a launcher entry
 #   zen-gh launch <name|id>                   launch an app (ensuring its entry
-#                                             exists first)
+#                                             exists first) or open a plugin
 #   zen-gh sync-menu                          add a menu row for anything missing
 #                                             and prune rows for things removed
 #                                             by other tools
@@ -1167,7 +1167,7 @@ plugin_row() {
   enabled="$(plugin_enabled "$id")"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$name" "${src:-$dir}" "$slug" "$remote" "$branch" "$version" "$commit" "$behind" \
-    "" "" "$mver" "plugin" "$label" "$id" "$enabled" "$linked" ""
+    "" "" "$mver" "plugin" "$label" "$id" "$enabled" "$linked" "$id"
 }
 
 resolve_target() {
@@ -1590,7 +1590,12 @@ cmd_launch() {
   resolved="$(resolve_target "$arg")" || die "not tracked: $arg"
   kind="$(printf '%s' "$resolved" | cut -f1)"
   path="$(printf '%s' "$resolved" | cut -f2)"
-  [ "$kind" = "app" ] || die "'$arg' is an Omarchy plugin, not a launchable app"
+  if [ "$kind" = "plugin" ]; then
+    id="$(printf '%s' "$resolved" | cut -f3)"
+    say "==> Opening $arg"
+    omarchy-shell shell toggle "$id" || true
+    return 0
+  fi
   # Make sure there is a menu entry first (a checkout installed before this
   # plugin added launcher entries, or one missing its entry, gets one now).
   install_launcher_entry "$path" >/dev/null 2>&1
