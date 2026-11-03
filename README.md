@@ -20,6 +20,9 @@ searchable dashboard:
 - **Forget / uninstall** — hide a project (keep its files) or fully uninstall
   it, reverting the Omarchy defaults and menu row it added.
 
+  <img width="491" height="703" alt="image" src="https://github.com/user-attachments/assets/937df419-5d5f-4663-afef-b45033fe3fa3" />
+
+
 Free and open source under the [MIT license](LICENSE). No account, no telemetry.
 
 ## Downloads
