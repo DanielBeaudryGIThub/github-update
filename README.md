@@ -12,7 +12,8 @@ searchable dashboard:
   behind) from the panel; it runs in a floating terminal so you can watch.
 - **Install from a URL** — paste a GitHub URL (or `owner/repo`) and it clones,
   follows the repo's own install steps / build system, and adds a launcher and
-  menu row.
+  menu row. A project is installed once: a repo already present as a checkout or
+  as an Omarchy plugin is refused (and shown once in the list).
 - **Launch from the panel** — a ▶ button on each app opens it (and opens a
   plugin's panel); the plugin keeps every app's launcher entry in the menu
   alive, creating it if it is missing.

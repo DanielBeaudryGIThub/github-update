@@ -69,6 +69,9 @@ Panel {
   property bool confirmUninstallOpen: false
   property var pendingUninstall: null
 
+  // The already-installed project the install field would duplicate, if any.
+  readonly property var installDuplicate: installedDuplicate(addField.text)
+
   readonly property int updateCount: {
     var n = 0
     for (var i = 0; i < apps.length; i++) if (Number(apps[i].behind) > 0) n++
@@ -90,6 +93,24 @@ Panel {
   function displayName(app) {
     if (!app) return ""
     return app.label && String(app.label) !== "" ? String(app.label) : String(app.name)
+  }
+
+  // Is the text in the install field a project that is already installed?
+  // Compares the repo name, the full owner/repo slug and the installed slug, so
+  // "pen-setup", "owner/pen-setup" and a full URL all hit the same row.
+  function installedDuplicate(value) {
+    var raw = String(value || "").trim().replace(/\.git$/, "").replace(/\/+$/, "")
+    if (raw === "") return null
+    var slug = raw.replace(/^.*github\.com[\/:]/, "").replace(/^\/+/, "").toLowerCase()
+    var repo = slug.split("/").pop()
+    for (var i = 0; i < apps.length; i++) {
+      var a = apps[i]
+      var name = String(a.name || "").toLowerCase()
+      var installed = String(a.slug || "").toLowerCase()
+      if (name !== "" && (name === repo || name === slug)) return a
+      if (installed !== "" && (installed === slug || installed.split("/").pop() === repo)) return a
+    }
+    return null
   }
 
   function shellQuote(value) {
@@ -133,6 +154,11 @@ Panel {
   function installFromInput() {
     var value = String(addField.text).trim()
     if (value === "") return
+    var dup = installedDuplicate(value)
+    if (dup) {
+      statusText = displayName(dup) + " is already installed"
+      return
+    }
     runInTerminal("zen-gh add " + shellQuote(value))
     addField.text = ""
     statusText = "Cloning " + value + "…"
@@ -400,7 +426,9 @@ Panel {
             TextField {
               id: addField
               width: parent.width - installButton.width - parent.spacing
-              placeholderText: "Paste a GitHub URL or owner/repo to install"
+              placeholderText: root.installDuplicate
+                ? root.displayName(root.installDuplicate) + " is already installed"
+                : "Paste a GitHub URL or owner/repo to install"
               foreground: root.foreground
               accent: root.accent
               Keys.onEscapePressed: function(event) { root.close(); event.accepted = true }
@@ -409,11 +437,12 @@ Panel {
 
             Button {
               id: installButton
-              text: "Install"
+              text: root.installDuplicate ? "Installed" : "Install"
               iconText: root.glyphPlus
               foreground: root.foreground
               accent: root.accent
               fontFamily: root.fontFamily
+              enabled: !root.installDuplicate
               onClicked: root.installFromInput()
             }
           }

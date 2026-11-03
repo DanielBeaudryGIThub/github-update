@@ -134,6 +134,26 @@ origin_url() {
   printf '%s' "$url"
 }
 
+# Where <slug> is already installed: one "kind<TAB>path" line per checkout or
+# plugin whose origin is that GitHub repo. A repo can be installed under a
+# different folder name, or both as an app and as a plugin, so compare origins
+# rather than names. Used to refuse a second copy.
+slug_installs() {
+  local slug="$1" dir path
+  [ -n "$slug" ] || return 0
+  for dir in "$HOME_DIR"/*/; do
+    path="${dir%/}"
+    [ -d "$path/.git" ] || continue
+    [ "$(github_slug "$(origin_url "$path")")" = "$slug" ] && printf 'app\t%s\n' "$path"
+  done
+  for dir in "$PLUGINS_DIR"/*/; do
+    path="${dir%/}"
+    [ -d "$path" ] || continue
+    [ "$(github_slug "$(origin_url "$path")")" = "$slug" ] && printf 'plugin\t%s\n' "$path"
+  done
+  return 0
+}
+
 sanitize_key() { printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '-'; }
 prettify() {
   printf '%s' "$1" | sed -E 's/[-_]+/ /g' |
@@ -1225,6 +1245,27 @@ for ln in sys.stdin.read().splitlines():
         "launch": p[16] if len(p) > 16 else "",
     })
 rows.sort(key=lambda r: (r["kind"] != "app", r["name"].lower()))
+
+# A repo can be present both as a checkout and as an installed plugin (older
+# versions installed it twice). Show it once, keeping the plugin row: that is
+# the copy Omarchy actually loads.
+plugin_names = {r["name"].lower() for r in rows if r["kind"] == "plugin"}
+plugin_slugs = {r["slug"].lower() for r in rows if r["kind"] == "plugin" and r["slug"]}
+deduped = []
+seen = set()
+for r in rows:
+    if r["kind"] == "app":
+        if r["name"].lower() in plugin_names:
+            continue
+        if r["slug"] and r["slug"].lower() in plugin_slugs:
+            continue
+    key = r["slug"].lower() if r["slug"] else "name:" + r["name"].lower()
+    if key in seen:
+        continue
+    seen.add(key)
+    deduped.append(r)
+rows = deduped
+
 print(json.dumps(rows))
 '
 }
@@ -1316,7 +1357,7 @@ cmd_list() {
 }
 
 cmd_add() {
-  local arg="" no_install=0 a slug url name stage id target section
+  local arg="" no_install=0 a slug url name stage id target section existing ekind epath
   for a in "$@"; do
     case "$a" in
       --no-install) no_install=1 ;;
@@ -1331,6 +1372,17 @@ cmd_add() {
   esac
   [ -n "$slug" ] || die "not a github url: $arg"
   name="${slug##*/}"
+
+  # Never install a second copy: the repo may already be present as a checkout
+  # under another folder name, or installed as an Omarchy plugin (whose folder
+  # is its manifest id, not the repo name).
+  existing="$(slug_installs "$slug" | head -n1)"
+  if [ -n "$existing" ]; then
+    ekind="$(printf '%s' "$existing" | cut -f1)"
+    epath="$(printf '%s' "$existing" | cut -f2)"
+    say "already installed as $ekind: $epath"
+    die "refusing a second copy; use 'zen-gh update $(basename "$epath")'"
+  fi
 
   stage="$STATE_DIR/.stage.$$"
   rm -rf "$stage"
