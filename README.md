@@ -13,6 +13,8 @@ searchable dashboard:
 - **Install from a URL** — paste a GitHub URL (or `owner/repo`) and it clones,
   follows the repo's own install steps / build system, and adds a launcher and
   menu row.
+- **Launch from the panel** — a ▶ button on each app opens it; the plugin keeps
+  every app's launcher entry in the menu alive, creating it if it is missing.
 - **Forget / uninstall** — hide a project (keep its files) or fully uninstall
   it, reverting the Omarchy defaults and menu row it added.
 

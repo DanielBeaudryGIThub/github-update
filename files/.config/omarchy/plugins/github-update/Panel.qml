@@ -59,6 +59,7 @@ Panel {
   readonly property string glyphDown: String.fromCodePoint(0x2193)
   readonly property string glyphDefault: String.fromCodePoint(0xF04CE)
   readonly property string glyphLink: String.fromCodePoint(0xF0339)
+  readonly property string glyphPlay: String.fromCodePoint(0xF040A)
 
   property var apps: []
   property bool loading: false
@@ -99,7 +100,9 @@ Panel {
   function refresh(fetch) {
     loading = true
     statusText = ""
-    scan.command = fetch ? ["zen-gh", "list-json", "--fetch", "--sync-menu"] : ["zen-gh", "list-json", "--sync-menu"]
+    scan.command = fetch
+      ? ["zen-gh", "list-json", "--fetch", "--sync-menu", "--sync-launchers"]
+      : ["zen-gh", "list-json", "--sync-menu", "--sync-launchers"]
     scan.running = true
   }
 
@@ -112,6 +115,18 @@ Panel {
       return
     }
     Qt.openUrlExternally("https://github.com/" + slug)
+  }
+
+  // Launch an app through its launcher entry (created first if it is missing).
+  function launchApp(app) {
+    if (!app) return
+    if (app.kind === "plugin") {
+      statusText = displayName(app) + " is a plugin, not an app"
+      return
+    }
+    if (bar && typeof bar.run === "function")
+      bar.run("zen-gh launch " + shellQuote(app.name))
+    statusText = "Launching " + displayName(app) + "…"
   }
 
   function runInTerminal(command) {
@@ -445,6 +460,7 @@ Panel {
                 readonly property bool selected: index === root.selectedIndex
                 readonly property int behind: Number(modelData.behind) > 0 ? Number(modelData.behind) : 0
                 readonly property bool linked: modelData.linked === true
+                readonly property bool launchable: modelData.kind === "app" && String(modelData.launch || "") !== ""
                 readonly property string sourcePath: String(modelData.path || "").replace(/^\/home\/[^\/]+/, "~")
                 readonly property var defaults: modelData.defaults || []
                 // Declared version from the app's manifest, with the checked-out
@@ -487,8 +503,22 @@ Panel {
                   anchors.rightMargin: Style.spacing.sm
                   spacing: Style.spacing.sm
 
+                  PanelActionButton {
+                    id: playButton
+                    iconText: root.glyphPlay
+                    visible: row.modelData.kind === "app"
+                    tooltipText: row.launchable
+                      ? "Launch " + root.displayName(row.modelData)
+                      : "No launcher entry for " + root.displayName(row.modelData) + " yet"
+                    foreground: root.foreground
+                    hoverColor: root.accent
+                    fontFamily: root.fontFamily
+                    enabled: row.launchable
+                    onClicked: { root.selectedIndex = row.index; root.launchApp(row.modelData) }
+                  }
+
                   Column {
-                    width: Math.max(0, parent.width - badges.width - rowActions.width - parent.spacing * 2)
+                    width: Math.max(0, parent.width - playButton.width - badges.width - rowActions.width - parent.spacing * 3)
                     spacing: Style.spacing.xxs
 
                     Text {
@@ -636,7 +666,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: "Enter update · X uninstall · click opens GitHub · right-click updates"
+            text: "▶ launch · Enter update · X uninstall · click opens GitHub · right-click updates"
             color: Qt.darker(root.foreground, 2.0)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

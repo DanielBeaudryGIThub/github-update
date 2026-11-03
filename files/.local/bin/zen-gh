@@ -7,6 +7,8 @@
 #   plugin  a checkout under ~/.config/omarchy/plugins (an Omarchy shell plugin)
 #
 #   zen-gh list-json [--fetch] [--sync-menu]  one JSON array of tracked apps
+#                     [--sync-launchers]      (--sync-launchers also makes sure
+#                                             every app has a launcher entry)
 #   zen-gh add <url|owner/repo>               clone/install a new GitHub project
 #   zen-gh update <name|id>                   pull (+build/rescan) one project
 #   zen-gh update-all                         update every project that is behind
@@ -26,6 +28,8 @@
 #   zen-gh links                              list linked folders
 #   zen-gh launcher <name|id>                 (re)register an app's built binary
 #                                             as a launcher entry
+#   zen-gh launch <name|id>                   launch an app (ensuring its entry
+#                                             exists first)
 #   zen-gh sync-menu                          add a menu row for anything missing
 #                                             and prune rows for things removed
 #                                             by other tools
@@ -249,6 +253,18 @@ desktop_ids_in_dir() {
     [ -f "$f" ] || continue
     desktop_entry_points_into "$f" "$dir" && basename "$f"
   done
+}
+
+# The desktop id the launcher should use for an app: the entry that already
+# points into its checkout, else the id its packaging template declares. Empty
+# when it has neither (nothing built/launchable yet).
+launch_id_for() {
+  local dir="$1" id tpl
+  id="$(desktop_ids_in_dir "$dir" | head -n1)"
+  [ -n "$id" ] && { printf '%s' "$id"; return 0; }
+  tpl="$(desktop_template_for "$dir")"
+  [ -n "$tpl" ] && { printf '%s' "$(basename "$tpl")"; return 0; }
+  return 0
 }
 
 installed_icon_path() {
@@ -1068,11 +1084,30 @@ cmd_sync_menu() {
   return 0
 }
 
+# Make sure every tracked app has a launcher entry (the "menu icon" the panel
+# launches with). Runs silently and idempotently: apps that already have an
+# entry, or that are not GUI apps with a built binary, are skipped.
+cmd_sync_launchers() {
+  local dir path name src
+  for dir in "$HOME_DIR"/*/; do
+    path="${dir%/}"
+    name="$(basename "$path")"
+    case "$name" in .*) continue ;; esac
+    ignored "$name" && continue
+    is_link_target "$path" && continue
+    [ -d "$path/.git" ] || continue
+    [ -n "$(github_slug "$(origin_url "$path")")" ] || continue
+    src="$(link_for "$name")"
+    [ -n "$src" ] && [ -d "$src/.git" ] || src=""
+    install_launcher_entry "${src:-$path}" >/dev/null 2>&1
+  done
+  return 0
+}
 
 # ------------------------------------------------------------------ discovery
 # One tab-separated row for an app checkout, or non-zero if not a github repo.
 app_row() {
-  local dir="$1" src="${2:-}" remote slug name branch version commit behind build defs manifest
+  local dir="$1" src="${2:-}" remote slug name branch version commit behind build defs manifest launch
   [ -n "$src" ] && [ -d "$src" ] && dir="$src"
   [ -d "$dir/.git" ] || return 1
   remote="$(origin_url "$dir")" || return 1
@@ -1087,9 +1122,10 @@ app_row() {
   build="$(build_tool "$dir")"
   manifest="$(manifest_version "$dir")"
   defs="$(app_defaults "$dir" "$name" | paste -sd'|' -)"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  launch="$(launch_id_for "$dir")"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$name" "$dir" "$slug" "$remote" "$branch" "$version" "$commit" "$behind" \
-    "$build" "$defs" "$manifest" "app" "$name" "" ""
+    "$build" "$defs" "$manifest" "app" "$name" "" "" "false" "$launch"
 }
 
 # One tab-separated row for an Omarchy shell plugin in the plugins dir.
@@ -1129,9 +1165,9 @@ plugin_row() {
     behind=0
   fi
   enabled="$(plugin_enabled "$id")"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$name" "${src:-$dir}" "$slug" "$remote" "$branch" "$version" "$commit" "$behind" \
-    "" "" "$mver" "plugin" "$label" "$id" "$enabled" "$linked"
+    "" "" "$mver" "plugin" "$label" "$id" "$enabled" "$linked" ""
 }
 
 resolve_target() {
@@ -1186,6 +1222,7 @@ for ln in sys.stdin.read().splitlines():
         "pluginId": p[13] if len(p) > 13 else "",
         "enabled": (p[14] == "true") if len(p) > 14 else False,
         "linked": (p[15] == "true") if len(p) > 15 else False,
+        "launch": p[16] if len(p) > 16 else "",
     })
 rows.sort(key=lambda r: (r["kind"] != "app", r["name"].lower()))
 print(json.dumps(rows))
@@ -1236,14 +1273,18 @@ PY
 
 # -------------------------------------------------------------------- commands
 cmd_list() {
-  local fetch="" sync="" a dir path name src
+  local fetch="" sync="" sync_launchers="" a dir path name src
   for a in "$@"; do
     case "$a" in
       --fetch) fetch=1 ;;
       --sync-menu) sync=1 ;;
+      --sync-launchers) sync_launchers=1 ;;
     esac
   done
   load_plugin_state
+  # Ensure launcher entries exist before reporting, so the JSON's `launch`
+  # field describes what a click on the play button will actually start.
+  [ "$sync_launchers" = "1" ] && cmd_sync_launchers
   {
     for dir in "$HOME_DIR"/*/; do
       path="${dir%/}"
@@ -1543,6 +1584,25 @@ cmd_launcher() {
   install_launcher_entry "$path"
 }
 
+cmd_launch() {
+  local arg="${1:-}" resolved kind path id
+  [ -n "$arg" ] || die "which app?"
+  resolved="$(resolve_target "$arg")" || die "not tracked: $arg"
+  kind="$(printf '%s' "$resolved" | cut -f1)"
+  path="$(printf '%s' "$resolved" | cut -f2)"
+  [ "$kind" = "app" ] || die "'$arg' is an Omarchy plugin, not a launchable app"
+  # Make sure there is a menu entry first (a checkout installed before this
+  # plugin added launcher entries, or one missing its entry, gets one now).
+  install_launcher_entry "$path" >/dev/null 2>&1
+  id="$(desktop_ids_in_dir "$path" | head -n1)"
+  if [ -z "$id" ]; then
+    say "no launcher entry for '$arg' (nothing built to launch)"
+    return 1
+  fi
+  say "==> Launching $arg ($id)"
+  uwsm-app -- gtk-launch "$id" || true
+}
+
 cmd_remove() {
   local arg="${1:-}" resolved kind path pid name
   [ -n "$arg" ] || die "which app?"
@@ -1678,6 +1738,7 @@ case "${1:-list-json}" in
   unlink)     shift; cmd_unlink "${1:-}" ;;
   links)      shift; cmd_links ;;
   launcher)   shift; cmd_launcher "${1:-}" ;;
+  launch)     shift; cmd_launch "${1:-}" ;;
   sync-menu)  shift; cmd_sync_menu ;;
   *)          die "unknown command: ${1:-}" ;;
 esac
