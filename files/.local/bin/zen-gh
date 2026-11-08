@@ -218,29 +218,212 @@ build_app() {
   esac
 }
 
+# The repo's own documented install/uninstall command. Reads the same README
+# and docs the project page shows and prints "kind<TAB>arg", restricted to
+# commands we can verify locally (a shipped script, a Makefile/justfile target,
+# or a standard package-manager install). Raw README text is never executed.
+# Exits 2 when the docs name nothing we can run.
+doc_command() {
+  python3 - "$1" "$2" <<'PY'
+import os, re, sys
+
+root, phase = sys.argv[1], sys.argv[2]
+
+
+def read(path, limit=200000):
+    try:
+        with open(path, "r", errors="replace") as fh:
+            return fh.read(limit)
+    except OSError:
+        return ""
+
+
+def exists(rel):
+    return os.path.isfile(os.path.join(root, rel))
+
+
+def has_target(path, target):
+    return bool(re.search(r'^' + re.escape(target) + r'\s*[:=]', read(path), re.M))
+
+
+docs = []
+# Only install-focused docs: a random `docs/*.md` page can describe installing
+# a different component (a CLI, a dev tool), which is not this app's installer.
+for rel in ("README.md", "README", "readme.md", "Readme.md",
+            "INSTALL.md", "INSTALL", "install.md", "install.txt",
+            "docs/install.md", "docs/INSTALL.md",
+            "docs/installation.md", "docs/INSTALLATION.md"):
+    path = os.path.join(root, rel)
+    if os.path.isfile(path):
+        docs.append(read(path))
+
+raw = "\n".join(docs)
+text = raw.lower()
+if not text.strip():
+    sys.exit(2)
+
+
+def emit(kind, arg):
+    print(kind + "\t" + arg)
+    sys.exit(0)
+
+
+def script(rel):
+    # "./install.sh", "bash install.sh" and "scripts/install.sh" all count.
+    pat = r'(^|[\s`$(/])' + re.escape(rel.lstrip("./")) + r'\b'
+    return exists(rel) and re.search(pat, text)
+
+
+if phase == "install":
+    for rel in ("install.sh", "setup.sh", "scripts/install.sh",
+                "scripts/setup.sh", "bin/install.sh"):
+        if script(rel):
+            emit("script", rel)
+    if re.search(r'\bmake\s+install\b', text) and \
+            has_target(os.path.join(root, "Makefile"), "install"):
+        emit("make", "install")
+    if re.search(r'\bjust\s+install\b', text) and \
+            has_target(os.path.join(root, "justfile"), "install"):
+        emit("just", "install")
+    m = re.search(r'cargo\s+install\s+--path\s+([^\s`"\']+)', raw, re.I)
+    if m:
+        rel = m.group(1).rstrip(".,;:)")
+        rel = rel[2:] if rel.startswith("./") else rel
+        if rel in ("", ".") or os.path.isdir(os.path.join(root, rel)):
+            emit("cargo", "install --path " + (rel or "."))
+    if re.search(r'\bnpm\s+link\b', text) or \
+            re.search(r'\bnpm\s+install\s+-g\s+\.', text):
+        emit("npm", "install -g .")
+    if re.search(r'\bpipx\s+install\b', text):
+        emit("pipx", "install .")
+    if re.search(r'\b(?:python3?\s+-m\s+)?pip3?\s+install\b[^\n]*\.', text):
+        emit("pip", "install .")
+    if re.search(r'\bgo\s+install\s+\./\.\.\.', text):
+        emit("go", "install ./...")
+
+elif phase == "uninstall":
+    for rel in ("uninstall.sh", "scripts/uninstall.sh", "bin/uninstall.sh"):
+        if script(rel):
+            emit("script", rel)
+    if re.search(r'\bmake\s+uninstall\b', text) and \
+            has_target(os.path.join(root, "Makefile"), "uninstall"):
+        emit("make", "uninstall")
+    if re.search(r'\bjust\s+uninstall\b', text) and \
+            has_target(os.path.join(root, "justfile"), "uninstall"):
+        emit("just", "uninstall")
+    name = ""
+    m = re.search(r'^\[package\][^\[]*?^name\s*=\s*"([A-Za-z0-9._-]+)"',
+                  read(os.path.join(root, "Cargo.toml")), re.M | re.S)
+    if m:
+        name = m.group(1)
+    if name and re.search(r'\bcargo\s+uninstall\b', text):
+        emit("cargo", "uninstall " + name)
+    m = re.search(r'"name"\s*:\s*"([A-Za-z0-9@/._-]+)"',
+                  read(os.path.join(root, "package.json")))
+    if m and re.search(r'\bnpm\s+(?:uninstall|rm)\s+-g\b', text):
+        emit("npm", "uninstall -g " + m.group(1))
+    if m and re.search(r'\bpip3?\s+uninstall\b', text):
+        emit("pip", "uninstall -y " + m.group(1))
+
+sys.exit(2)
+PY
+}
+
+# Run the documented command. Returns 2 when the docs name nothing runnable,
+# otherwise the command's own exit status.
+run_doc_command() {
+  local dir="$1" phase="$2" spec kind arg rc
+  command -v python3 >/dev/null 2>&1 || return 2
+  spec="$(doc_command "$dir" "$phase")"
+  rc=$?
+  [ "$rc" -eq 0 ] && [ -n "$spec" ] || return 2
+  kind="${spec%%$'\t'*}"
+  arg="${spec#*$'\t'}"
+  case "$kind" in
+    script)
+      say "  docs: ./$arg"
+      ( cd "$dir" && bash "./$arg" )
+      ;;
+    make)
+      say "  docs: make $arg"
+      ( cd "$dir" && make "$arg" )
+      ;;
+    just)
+      say "  docs: just $arg"
+      ( cd "$dir" && just "$arg" )
+      ;;
+    cargo)
+      say "  docs: cargo $arg"
+      ( cd "$dir" && cargo $arg )
+      ;;
+    npm)
+      say "  docs: npm $arg"
+      ( cd "$dir" && npm $arg )
+      ;;
+    pip)
+      say "  docs: pip $arg"
+      ( cd "$dir" && python3 -m pip $arg )
+      ;;
+    pipx)
+      say "  docs: pipx $arg"
+      ( cd "$dir" && pipx $arg )
+      ;;
+    go)
+      say "  docs: go $arg"
+      ( cd "$dir" && go $arg )
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+# Run the repo's documented uninstall step before its files are removed. A
+# missing documented step is not an error: the caller still disables and
+# deletes the install.
+run_doc_uninstall() {
+  local dir="$1" rc
+  [ -n "$dir" ] && [ -d "$dir" ] || return 0
+  run_doc_command "$dir" uninstall
+  rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) say "-- no documented uninstall step" ;;
+    *) say "!! the documented uninstall command failed (exit $rc)" ;;
+  esac
+  return 0
+}
+
 # Follow the repo's own install instructions, then fall back to a build.
 install_app() {
-  local dir="$1" name
+  local dir="$1" name rc no_launcher="${2:-}"
   name="$(basename "$dir")"
   say "==> Install instructions for $name"
-  if [ -f "$dir/install.sh" ]; then
-    ( cd "$dir" && bash ./install.sh )
-  elif [ -f "$dir/setup.sh" ]; then
-    ( cd "$dir" && bash ./setup.sh )
-  elif [ -f "$dir/scripts/install.sh" ]; then
-    ( cd "$dir" && bash ./scripts/install.sh )
-  elif [ -f "$dir/Makefile" ] && grep -qE '^install[[:space:]]*:' "$dir/Makefile"; then
-    ( cd "$dir" && make install )
-  elif [ -f "$dir/justfile" ] && grep -qE '^install([[:space:]]|:)' "$dir/justfile"; then
-    ( cd "$dir" && just install )
-  else
-    say "-- no install script; building instead"
-    build_app "$dir"
+  run_doc_command "$dir" install
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    if [ -f "$dir/install.sh" ]; then
+      ( cd "$dir" && bash ./install.sh )
+    elif [ -f "$dir/setup.sh" ]; then
+      ( cd "$dir" && bash ./setup.sh )
+    elif [ -f "$dir/scripts/install.sh" ]; then
+      ( cd "$dir" && bash ./scripts/install.sh )
+    elif [ -f "$dir/Makefile" ] && grep -qE '^install[[:space:]]*:' "$dir/Makefile"; then
+      ( cd "$dir" && make install )
+    elif [ -f "$dir/justfile" ] && grep -qE '^install([[:space:]]|:)' "$dir/justfile"; then
+      ( cd "$dir" && just install )
+    else
+      say "-- no install script; building instead"
+      build_app "$dir"
+    fi
+  elif [ "$rc" -ne 0 ]; then
+    say "!! the documented install command failed (exit $rc)"
   fi
   # A build leaves the binary in target/release but registers nothing, so the
   # app never appears in the launcher. Install the entry the repo ships (or a
-  # minimal one) pointing at what was just built.
-  install_launcher_entry "$dir"
+  # minimal one) pointing at what was just built. Plugins pass "no-launcher":
+  # they are opened from the bar/menu, not the app list.
+  [ "$no_launcher" = "no-launcher" ] || install_launcher_entry "$dir"
 }
 
 # ------------------------------------------------------------ launcher entries
@@ -493,8 +676,91 @@ load_plugin_state() {
 plugin_enabled() {
   load_plugin_state
   command -v jq >/dev/null 2>&1 || { printf ''; return; }
+  # `false // empty` is empty in jq (false is null-ish), so stringify first:
+  # a disabled plugin must print "false", not nothing.
   printf '%s' "$PLUGIN_STATE" |
-    jq -r --arg id "$1" '[.[] | select(.id == $id) | .enabled][0] // empty'
+    jq -r --arg id "$1" 'first(.[] | select(.id == $id) | .enabled) | tostring'
+}
+
+reload_plugin_state() {
+  PLUGIN_STATE=""
+  load_plugin_state
+}
+
+# The manifest's kinds, space separated ("panel bar-widget").
+plugin_kinds() {
+  python3 - "$1/manifest.json" <<'PY'
+import json, sys
+try:
+    m = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+print(" ".join(str(k) for k in (m.get("kinds") or [])))
+PY
+}
+
+# Wait until the shell has discovered a freshly installed plugin. Enabling too
+# early is the usual reason an install appears to work but never activates.
+wait_plugin_known() {
+  local id="$1" i
+  command -v omarchy-plugin-list >/dev/null 2>&1 || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  for i in $(seq 1 40); do
+    if omarchy-plugin-list --json 2>/dev/null |
+      jq -e --arg id "$id" 'any(.[]; .id == $id)' >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
+# Turn a freshly installed plugin on the way `omarchy plugin add --enable` does:
+# wait for discovery, use a placement only for bar widgets, never pass a
+# placement to a bar replacement, check the exit status, and verify that the
+# shell reports it enabled. Prints an actionable hint instead of failing
+# silently, which is what left installs looking successful but inactive.
+enable_plugin() {
+  local dir="$1" id="$2" kinds section out rc attempt
+  [ -n "$id" ] || return 1
+  [ -d "$dir" ] || { say "-- plugin folder for '$id' is missing; cannot activate"; return 1; }
+  if ! command -v omarchy-plugin-enable >/dev/null 2>&1; then
+    say "-- omarchy-plugin-enable is unavailable; enable later: omarchy plugin enable $id"
+    return 0
+  fi
+  kinds="$(plugin_kinds "$dir")"
+  section="$(plugin_field "$dir" barWidget.defaultSection)"
+  [ -n "$section" ] || section="right"
+  rescan_plugins
+  if ! wait_plugin_known "$id"; then
+    say "!! the shell did not discover '$id'; enable later: omarchy plugin enable $id"
+    return 1
+  fi
+  for attempt in 1 2; do
+    if printf '%s\n' "$kinds" | tr ' ' '\n' | grep -qx bar; then
+      # A bar replaces the current bar; a section placement is invalid for it.
+      out="$(omarchy-plugin-enable "$id" 2>&1)"
+      rc=$?
+    elif printf '%s\n' "$kinds" | tr ' ' '\n' | grep -qx bar-widget; then
+      out="$(omarchy-plugin-enable "$id" --section "$section" 2>&1)"
+      rc=$?
+    else
+      out="$(omarchy-plugin-enable "$id" 2>&1)"
+      rc=$?
+    fi
+    [ "$rc" -eq 0 ] && break
+    # The first call can still race discovery; rescan and try once more.
+    rescan_plugins
+    wait_plugin_known "$id" || true
+  done
+  [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /'
+  reload_plugin_state
+  if [ "$(plugin_enabled "$id")" = "true" ]; then
+    say "  activated $id"
+    return 0
+  fi
+  say "!! '$id' is installed but not active; run: omarchy plugin enable $id"
+  return 1
 }
 
 # --------------------------------------------------------------- default apps
@@ -1357,7 +1623,7 @@ cmd_list() {
 }
 
 cmd_add() {
-  local arg="" no_install=0 a slug url name stage id target section existing ekind epath
+  local arg="" no_install=0 a slug url name stage id target existing ekind epath rc
   for a in "$@"; do
     case "$a" in
       --no-install) no_install=1 ;;
@@ -1404,14 +1670,17 @@ cmd_add() {
     fi
     mkdir -p "$PLUGINS_DIR"
     mv "$stage" "$target"
-    rescan_plugins
-    if command -v omarchy-plugin-enable >/dev/null 2>&1; then
-      section="$(plugin_field "$target" barWidget.defaultSection)"
-      [ -n "$section" ] || section="right"
-      omarchy-plugin-enable "$id" --section "$section" >/dev/null 2>&1 || true
-    fi
     cmd_sync_menu || true
+    # The repo's own installer may also install a helper binary or config the
+    # plugin needs; run it the way its README documents before activating.
+    if [ -f "$target/install.sh" ] || [ -f "$target/setup.sh" ] ||
+      [ -f "$target/scripts/install.sh" ] || [ -n "$(doc_command "$target" install)" ]; then
+      install_app "$target" no-launcher || say "!! install step failed; the plugin may need manual setup"
+    fi
+    enable_plugin "$target" "$id"
+    rc=$?
     say "Installed Omarchy plugin '$id'."
+    [ "$rc" -eq 0 ] || return 1
     return 0
   fi
 
@@ -1432,11 +1701,12 @@ cmd_add() {
   fi
   # Again afterwards: an install script can add plugins or new checkouts.
   cmd_sync_menu || true
+  rescan_plugins
   say "Installed $name at $dest"
 }
 
 cmd_update() {
-  local arg="${1:-}" resolved kind path pid name out
+  local arg="${1:-}" resolved kind path pid name out inst
   [ -n "$arg" ] || die "which app?"
   resolved="$(resolve_target "$arg")" || die "not tracked: $arg"
   kind="$(printf '%s' "$resolved" | cut -f1)"
@@ -1456,12 +1726,25 @@ cmd_update() {
       say "-- not a git checkout; nothing to pull"
     fi
     # A linked source folder ships its own installer: re-run it so the
-    # installed plugin picks up whatever changed there.
-    if [ -f "$path/install.sh" ] || [ -f "$path/setup.sh" ] || [ -f "$path/scripts/install.sh" ]; then
+    # installed plugin picks up whatever changed there. The repo's README/docs
+    # count too, so it is reinstalled the way its author documents.
+    if [ -f "$path/install.sh" ] || [ -f "$path/setup.sh" ] ||
+      [ -f "$path/scripts/install.sh" ] || [ -n "$(doc_command "$path" install)" ]; then
       say "-- reinstalling from $path"
-      install_app "$path" || { say "!! install step failed for $name"; return 1; }
+      install_app "$path" no-launcher || { say "!! install step failed for $name"; return 1; }
     fi
-    rescan_plugins
+    # Keep an enabled plugin enabled after the update; a disabled one stays off.
+    inst="$PLUGINS_DIR/$pid"
+    if [ -d "$inst" ] || [ -L "$inst" ]; then
+      reload_plugin_state
+      if [ "$(plugin_enabled "$pid")" != "false" ]; then
+        enable_plugin "$inst" "$pid" || true
+      else
+        rescan_plugins
+      fi
+    else
+      rescan_plugins
+    fi
     say "==> $name done"
     return 0
   fi
@@ -1532,17 +1815,22 @@ cmd_update_all() {
 }
 
 cmd_install() {
-  local arg="${1:-}" resolved kind path
+  local arg="${1:-}" resolved kind path pid inst
   [ -n "$arg" ] || die "which app?"
   resolved="$(resolve_target "$arg")" || die "not tracked: $arg"
   kind="$(printf '%s' "$resolved" | cut -f1)"
   path="$(printf '%s' "$resolved" | cut -f2)"
+  pid="$(printf '%s' "$resolved" | cut -f3)"
   if [ "$kind" = "plugin" ]; then
-    if [ -f "$path/install.sh" ] || [ -f "$path/setup.sh" ] || [ -f "$path/scripts/install.sh" ]; then
-      install_app "$path"
-      return 0
+    if [ -f "$path/install.sh" ] || [ -f "$path/setup.sh" ] ||
+      [ -f "$path/scripts/install.sh" ] || [ -n "$(doc_command "$path" install)" ]; then
+      install_app "$path" no-launcher || { say "!! install step failed for $arg"; return 1; }
+    else
+      say "-- '$arg' has no install script; reusing the installed plugin copy"
     fi
-    say "-- '$arg' is an Omarchy plugin; run: omarchy plugin update $arg"
+    inst="$PLUGINS_DIR/$pid"
+    [ -d "$inst" ] || [ -L "$inst" ] || inst="$path"
+    enable_plugin "$inst" "$pid" || true
     return 0
   fi
   install_app "$path"
@@ -1661,7 +1949,7 @@ cmd_launch() {
 }
 
 cmd_remove() {
-  local arg="${1:-}" resolved kind path pid name
+  local arg="${1:-}" resolved kind path pid name inst
   [ -n "$arg" ] || die "which app?"
   resolved="$(resolve_target "$arg")" || die "not tracked: $arg"
   kind="$(printf '%s' "$resolved" | cut -f1)"
@@ -1670,7 +1958,14 @@ cmd_remove() {
   name="$(printf '%s' "$resolved" | cut -f4)"
   say "==> Removing $name"
   if [ "$kind" = "plugin" ]; then
-    remove_plugin "$path" "$pid"
+    # A linked plugin resolves to its source folder; remove the installed copy,
+    # never the folder that holds the source.
+    inst="$PLUGINS_DIR/$pid"
+    if [ -e "$inst" ] || [ -L "$inst" ]; then
+      remove_plugin "$inst" "$pid"
+    else
+      remove_plugin "$path" "$pid"
+    fi
   else
     deactivate_defaults "$path" "$name"
   fi
@@ -1681,17 +1976,53 @@ cmd_remove() {
 }
 
 remove_plugin() {
-  local path="$1" id="$2" enabled backup n
+  local path="$1" id="$2" enabled backup n out target
+  # Remove the installed copy when one exists; never a linked source folder.
+  target="$path"
+  if [ -e "$PLUGINS_DIR/$id" ] || [ -L "$PLUGINS_DIR/$id" ]; then
+    target="$PLUGINS_DIR/$id"
+  fi
+  [ -e "$target" ] || [ -L "$target" ] || { say "  '$id' is not installed"; return 0; }
+
+  # 1. Run the repo's documented uninstall step while its files still exist, so
+  #    whatever the author says must be reverted (services, defaults, symlinks)
+  #    is undone the documented way.
+  run_doc_uninstall "$target" "$id"
+  if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+    say "  the documented uninstall step removed $id"
+    rescan_plugins
+    return 0
+  fi
+
+  # 2. Prefer Omarchy's own remove command: it disables the plugin, restores a
+  #    clone's source bar/widget, backs up non-git folders and rescans, exactly
+  #    like `omarchy plugin remove`.
+  if [ "$target" = "$PLUGINS_DIR/$id" ] &&
+    command -v omarchy-plugin-remove >/dev/null 2>&1; then
+    if out="$(omarchy-plugin-remove "$id" --yes 2>&1)"; then
+      [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/  /'
+      reload_plugin_state
+      if [ "$(plugin_enabled "$id")" = "true" ]; then
+        say "  the shell still lists '$id'; disabling it again"
+        omarchy-shell shell setPluginEnabled "$id" false >/dev/null 2>&1 || true
+      fi
+      rescan_plugins
+      return 0
+    fi
+    say "  omarchy plugin remove failed; using the built-in path"
+  fi
+
+  # 3. Fallback for linked/renamed or non-standard folders.
   enabled="$(plugin_enabled "$id")"
   if [ "$enabled" = "true" ] && command -v omarchy-shell >/dev/null 2>&1; then
     omarchy-shell shell setPluginEnabled "$id" false >/dev/null 2>&1 || true
   fi
-  if [ -L "$path" ]; then
-    rm -f "$path"
+  if [ -L "$target" ]; then
+    rm -f "$target"
     say "  unlinked $id"
-  elif [ -d "$path/.git" ]; then
-    rm -rf -- "$path"
-    say "  deleted $path"
+  elif [ -d "$target/.git" ]; then
+    rm -rf -- "$target"
+    say "  deleted $target"
   else
     backup="$PLUGINS_DIR/.${id}.bak.$(date -u +%Y%m%d%H%M%S)"
     n=1
@@ -1699,10 +2030,17 @@ remove_plugin() {
       backup="${backup}-${n}"
       n=$((n + 1))
     done
-    mv "$path" "$backup" || die "failed to back up $path"
+    mv "$target" "$backup" || die "failed to back up $target"
     say "  backed up to $backup"
   fi
   rescan_plugins
+  # Make sure the shell really forgot it, even if it kept an enabled record.
+  reload_plugin_state
+  if [ "$(plugin_enabled "$id")" = "true" ] && command -v omarchy-shell >/dev/null 2>&1; then
+    say "  the shell still lists '$id'; disabling it again"
+    omarchy-shell shell setPluginEnabled "$id" false >/dev/null 2>&1 || true
+    rescan_plugins
+  fi
 }
 
 cmd_uninstall() {
@@ -1759,6 +2097,9 @@ cmd_uninstall() {
     if [ "$path" != "$HOME_DIR/$name" ] && [ -n "$(link_for "$name")" ]; then
       die "refusing: '$name' is linked to $path; run 'zen-gh unlink $name' first"
     fi
+    # The repo's own documented uninstall step runs before the checkout goes
+    # away, so anything its installer registered is removed the documented way.
+    run_doc_uninstall "$path" "$name"
     if ! snapshot_revert "$name"; then
       deactivate_defaults "$path" "$name"
       remove_desktop_entries "$path"

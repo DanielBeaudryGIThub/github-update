@@ -17,6 +17,13 @@ searchable dashboard:
 - **Launch from the panel** — a ▶ button on each app opens it (and opens a
   plugin's panel); the plugin keeps every app's launcher entry in the menu
   alive, creating it if it is missing.
+- **Follows the repo's own instructions** — before installing it reads the
+  project's README/INSTALL docs and runs the documented command it can verify
+  (`./install.sh`, `make install`, `cargo install --path …`, …). Removal runs
+  the documented uninstall step first.
+- **Reliable plugin activation** — after installing an Omarchy plugin it waits
+  for the shell to discover it, uses the right placement, checks that it
+  actually turned on, and prints the exact command to run if it did not.
 - **Forget / uninstall** — hide a project (keep its files) or fully uninstall
   it, reverting the Omarchy defaults and menu row it added.
 
